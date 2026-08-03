@@ -5,7 +5,7 @@ getgenv().Settings = {
     ["Chest Tween Speed"] = 325; -- tốc độ tween thẳng vào chest, tăng nếu muốn nhanh hơn
     ["Chest Touch Radius"] = 8; -- khoảng cách bắt đầu firetouch chest
     ["TP Bypass"] = true;
-    ["TP Bypass Distance"] = 1500;
+    ["TP Bypass Distance"] = 1000;
     ["TP Bypass Max Attempts"] = 3;
     ["TP Bypass Min Gain"] = 300;
     ["TP Bypass Respawn Timeout"] = 12;
@@ -13,7 +13,11 @@ getgenv().Settings = {
     -- Chỉ CFrame + Jump tới chest thuộc đảo hiện tại.
     ["Chest Same Island Only"] = true;
     ["Chest CFrame Timeout"] = 3;
-    ["Chest CFrame Interval"] = 0.05;
+    ["Chest CFrame Interval"] = 0.06;
+    ["Chest CFrame Hard Timeout"] = 5;
+    ["Chest No Movement Timeout"] = 0.9;
+    ["Chest Watchdog Timeout"] = 8;
+    ["Chest Stuck Ignore"] = 45;
 
     -- Server Browser lấy từ bản Cyborg.
     ["Hop Max Pages"] = 200;
@@ -1064,142 +1068,209 @@ task.spawn(function()
 end)
 
 
+local ChestFarmRuntime = {
+    Token = 0,
+    Active = false,
+    ActiveChest = nil,
+    LastProgress = os.clock(),
+    LastDistance = math.huge,
+    LastReason = "idle",
+}
+
+-- CFrame chest chạy trong worker riêng và có hard-timeout. Nếu executor/game nuốt
+-- một lệnh CFrame hoặc firetouch thì vòng farm vẫn thoát được, không đứng 1-2 phút.
 local function CFrameJumpChest(chest)
     if not chest
         or not chest:IsA("BasePart")
         or not chest.Parent
         or not chest.CanTouch then
-        return false
+        return false, "invalid_chest"
     end
 
     local _, _, startRoot = ChestBypassGetCharacter(1)
-    local lockedIsland =
-        startRoot
-        and ChestBypassGetCurrentIsland(startRoot)
-        or nil
+    local lockedIsland = startRoot and ChestBypassGetCurrentIsland(startRoot) or nil
 
     if getgenv().Settings["Chest Same Island Only"] ~= false
         and (not lockedIsland
             or not ChestBypassIsChestOnIsland(chest, lockedIsland)) then
-        return false
+        return false, "different_island"
     end
 
     Tween(false)
 
-    local timeout =
-        tonumber(getgenv().Settings["Chest CFrame Timeout"])
-        or 3
-    local interval =
-        tonumber(getgenv().Settings["Chest CFrame Interval"])
-        or 0.05
-    local touchRadius =
-        tonumber(getgenv().Settings["Chest Touch Radius"])
-        or 8
-    local skipDelay =
-        tonumber(getgenv().Settings["Skip Chest Delay"])
-        or 1
+    local timeout = tonumber(getgenv().Settings["Chest CFrame Timeout"]) or 3
+    local hardTimeout = tonumber(getgenv().Settings["Chest CFrame Hard Timeout"]) or 5
+    local noMoveTimeout = tonumber(getgenv().Settings["Chest No Movement Timeout"]) or 0.9
+    local interval = tonumber(getgenv().Settings["Chest CFrame Interval"]) or 0.06
+    local touchRadius = tonumber(getgenv().Settings["Chest Touch Radius"]) or 8
+    local skipDelay = tonumber(getgenv().Settings["Skip Chest Delay"]) or 1
 
-    timeout = math.clamp(timeout, 1, 10)
-    interval = math.clamp(interval, 0.02, 0.25)
+    timeout = math.clamp(timeout, 1, 8)
+    hardTimeout = math.clamp(hardTimeout, timeout + 0.5, 10)
+    noMoveTimeout = math.clamp(noMoveTimeout, 0.35, timeout)
+    interval = math.clamp(interval, 0.04, 0.25)
     skipDelay = math.clamp(skipDelay, 0.4, timeout)
 
-    local startedAt = os.clock()
-    local touched = false
+    ChestFarmRuntime.Token = ChestFarmRuntime.Token + 1
+    local myToken = ChestFarmRuntime.Token
+    ChestFarmRuntime.Active = true
+    ChestFarmRuntime.ActiveChest = chest
+    ChestFarmRuntime.LastProgress = os.clock()
+    ChestFarmRuntime.LastReason = "starting"
 
-    repeat
-        local char, humanoid, root = ChestBypassGetCharacter(1)
-        if not char or not humanoid or not root or humanoid.Health <= 0 then
-            return false
-        end
+    local finished = false
+    local result = false
+    local reason = "timeout"
 
-        if not chest or not chest.Parent or not chest.CanTouch then
-            break
-        end
+    task.spawn(function()
+        local ok, err = xpcall(function()
+            local startedAt = os.clock()
+            local lastMovedAt = startedAt
+            local lastDistance = math.huge
+            local touched = false
 
-        -- Kiểm tra lại mỗi vòng để tuyệt đối không CFrame sang đảo khác.
-        local currentIsland = ChestBypassGetCurrentIsland(root)
-        if getgenv().Settings["Chest Same Island Only"] ~= false
-            and (not currentIsland
-                or not ChestBypassIsChestOnIsland(chest, currentIsland)) then
-            return false
-        end
+            while ChestFarmRuntime.Token == myToken
+                and os.clock() - startedAt < timeout do
 
-        humanoid.Sit = false
+                if not chest or not chest.Parent or not chest.CanTouch then
+                    result = true
+                    reason = "collected"
+                    return
+                end
 
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
+                if CheckTool("Fist of Darkness") then
+                    result = true
+                    reason = "fist_found"
+                    return
+                end
 
-            if char.PrimaryPart then
-                char:SetPrimaryPartCFrame(chest.CFrame)
-            else
-                root.CFrame = chest.CFrame
+                local char, humanoid, root = ChestBypassGetCharacter(0.5)
+                if not char or not humanoid or not root or humanoid.Health <= 0 then
+                    reason = "character_missing"
+                    return
+                end
+
+                humanoid.Sit = false
+                humanoid.PlatformStand = false
+                humanoid.Jump = true
+
+                pcall(function()
+                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                end)
+
+                pcall(function()
+                    root.Anchored = false
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                end)
+
+                local targetCFrame = chest.CFrame * CFrame.new(0, 2.5, 0)
+
+                -- Ưu tiên đúng kiểu script gốc: CFrame thẳng. PivotTo chỉ là fallback
+                -- một lần khi CFrame bị server/executor trả ngược vị trí.
+                pcall(function()
+                    root.CFrame = targetCFrame
+                end)
+
+                task.wait(0.04)
+
+                local distance = (root.Position - chest.Position).Magnitude
+                if distance > touchRadius + 8 then
+                    pcall(function()
+                        char:PivotTo(targetCFrame)
+                    end)
+                    task.wait(0.03)
+                    distance = (root.Position - chest.Position).Magnitude
+                end
+
+                ChestFarmRuntime.LastDistance = distance
+
+                if distance + 10 < lastDistance then
+                    lastMovedAt = os.clock()
+                    ChestFarmRuntime.LastProgress = lastMovedAt
+                    lastDistance = distance
+                elseif lastDistance == math.huge then
+                    lastDistance = distance
+                end
+
+                pcall(function()
+                    humanoid.Jump = true
+                    humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+                end)
+
+                if distance <= touchRadius + 4 then
+                    touched = true
+                    ChestFarmRuntime.LastProgress = os.clock()
+
+                    pcall(function()
+                        firetouchinterest(root, chest, 0)
+                        firetouchinterest(chest, root, 0)
+                    end)
+                    task.wait(0.03)
+                    pcall(function()
+                        firetouchinterest(root, chest, 1)
+                        firetouchinterest(chest, root, 1)
+                    end)
+                end
+
+                if not chest or not chest.Parent or not chest.CanTouch then
+                    result = true
+                    reason = "collected"
+                    return
+                end
+
+                if touched and os.clock() - startedAt >= skipDelay then
+                    -- Giữ cách xử lý ghost chest của bản đầu, nhưng chỉ thực hiện
+                    -- sau khi đã thật sự tới gần và firetouch.
+                    pcall(function()
+                        chest.CanTouch = false
+                    end)
+                    result = true
+                    reason = "touch_complete"
+                    return
+                end
+
+                -- CFrame bị trả ngược/không đổi vị trí: thoát sớm để chọn chest khác.
+                if distance > 25 and os.clock() - lastMovedAt >= noMoveTimeout then
+                    reason = "cframe_rejected"
+                    return
+                end
+
+                task.wait(interval)
             end
+
+            reason = "attempt_timeout"
+        end, function(message)
+            return tostring(message)
         end)
 
-        pcall(function()
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-        end)
-
-        task.wait()
-
-        if chest
-            and chest.Parent
-            and chest.CanTouch
-            and (root.Position - chest.Position).Magnitude <= touchRadius then
-
-            touched = true
-            pcall(function()
-                firetouchinterest(root, chest, 0)
-                task.wait(0.03)
-                firetouchinterest(root, chest, 1)
-            end)
+        if not ok then
+            reason = "worker_error: " .. tostring(err)
         end
 
-        if CheckTool("Fist of Darkness") then
-            break
-        end
+        finished = true
+    end)
 
-        if touched
-            and chest
-            and chest.Parent
-            and chest.CanTouch
-            and os.clock() - startedAt >= skipDelay then
+    local waitStarted = os.clock()
+    repeat
+        task.wait(0.05)
+    until finished
+        or ChestFarmRuntime.Token ~= myToken
+        or os.clock() - waitStarted >= hardTimeout
 
-            chest.CanTouch = false
-            break
-        end
-
-        task.wait(interval)
-    until not chest
-        or not chest.Parent
-        or not chest.CanTouch
-        or IsDied(LocalPlayer.Character)
-        or CheckTool("Fist of Darkness")
-        or os.clock() - startedAt >= timeout
-
-    local _, humanoid, root = ChestBypassGetCharacter(1)
-    if chest
-        and chest.Parent
-        and chest.CanTouch
-        and humanoid
-        and humanoid.Health > 0
-        and root then
-
-        pcall(function()
-            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-            firetouchinterest(root, chest, 0)
-            task.wait(0.05)
-            firetouchinterest(root, chest, 1)
-        end)
-        task.wait(0.1)
+    if not finished then
+        ChestFarmRuntime.Token = ChestFarmRuntime.Token + 1
+        result = false
+        reason = "hard_timeout"
     end
 
-    if chest and chest.Parent and chest.CanTouch and touched then
-        chest.CanTouch = false
+    if ChestFarmRuntime.ActiveChest == chest then
+        ChestFarmRuntime.Active = false
+        ChestFarmRuntime.ActiveChest = nil
     end
+    ChestFarmRuntime.LastReason = reason
 
-    return true
+    return result, reason
 end
 
 local canPress = true
@@ -1256,6 +1327,41 @@ end
 
 local all = 0
 local IgnoredChests = setmetatable({}, {__mode = "k"})
+local ChestFailCounts = setmetatable({}, {__mode = "k"})
+
+
+-- Watchdog độc lập: nếu một lần xử lý chest không tạo tiến triển trong thời gian
+-- giới hạn, hủy token hiện tại và bỏ qua chest đó. Không reset nhân vật nên không
+-- làm mất Fist/Chalice hoặc vật phẩm đặc biệt.
+task.spawn(function()
+    while task.wait(1) do
+        if ChestFarmRuntime.Active and ChestFarmRuntime.ActiveChest then
+            local watchdogTimeout = tonumber(
+                getgenv().Settings["Chest Watchdog Timeout"]
+            ) or 8
+
+            if os.clock() - ChestFarmRuntime.LastProgress >= watchdogTimeout then
+                local stuckChest = ChestFarmRuntime.ActiveChest
+                ChestFarmRuntime.Token = ChestFarmRuntime.Token + 1
+                ChestFarmRuntime.Active = false
+                ChestFarmRuntime.ActiveChest = nil
+                ChestFarmRuntime.LastReason = "watchdog"
+
+                if stuckChest then
+                    IgnoredChests[stuckChest] = os.clock()
+                        + (tonumber(getgenv().Settings["Chest Stuck Ignore"]) or 45)
+                end
+
+                Tween(false)
+                SetText(
+                    "Chest watchdog | skipped stuck chest"
+                    .. "\nLast distance: "
+                    .. tostring(math.floor(ChestFarmRuntime.LastDistance or 0))
+                )
+            end
+        end
+    end
+end)
 
 local function GetNearestChest(islandName)
     local _, _, root = ChestBypassGetCharacter(3)
@@ -1356,26 +1462,6 @@ FarmBeli = (function(shouldStop)
                         chest, distance = GetNearestChest(currentIsland)
                     end
                 end
-            elseif getgenv().Settings["TP Bypass"] ~= false
-                and distance >= threshold then
-
-                SetText(
-                    "Collect Chests | TP Bypass"
-                    .. "\nIsland: "
-                    .. tostring(currentIsland or "Unknown")
-                    .. " | Spawns: "
-                    .. tostring(#ChestBypassState.Spawns)
-                    .. " | Distance: "
-                    .. tostring(math.floor(distance))
-                )
-
-                ChestBypassTo(chest.CFrame)
-                char, hum, root = ChestBypassGetCharacter(5)
-
-                if root then
-                    currentIsland = ChestBypassGetCurrentIsland(root)
-                    chest, distance = GetNearestChest(currentIsland)
-                end
             end
 
             if CheckTool("Fist of Darkness") or CheckMonster("Darkbeard") then
@@ -1410,14 +1496,39 @@ FarmBeli = (function(shouldStop)
                     .. tostring(math.floor(newDistance))
                 )
 
-                local attempted = CFrameJumpChest(chest)
+                local attempted, attemptReason = CFrameJumpChest(chest)
 
                 if attempted and (not chest.Parent or not chest.CanTouch) then
                     sessionCount = sessionCount + 1
                     all = all + 1
                     IgnoredChests[chest] = nil
+                    ChestFailCounts[chest] = nil
                 else
-                    IgnoredChests[chest] = os.clock() + 8
+                    local fails = (ChestFailCounts[chest] or 0) + 1
+                    ChestFailCounts[chest] = fails
+
+                    local hardFailure = attemptReason == "hard_timeout"
+                        or attemptReason == "watchdog"
+                        or attemptReason == "cframe_rejected"
+                        or tostring(attemptReason):find("worker_error", 1, true) ~= nil
+
+                    local ignoreSeconds
+                    if hardFailure then
+                        ignoreSeconds = tonumber(
+                            getgenv().Settings["Chest Stuck Ignore"]
+                        ) or 45
+                    else
+                        ignoreSeconds = fails >= 3 and 60 or 8
+                    end
+
+                    IgnoredChests[chest] = os.clock() + ignoreSeconds
+                    SetText(
+                        "Chest skipped | "
+                        .. tostring(attemptReason or "unknown")
+                        .. " | retry after "
+                        .. tostring(math.floor(ignoreSeconds))
+                        .. "s"
+                    )
                 end
             elseif chest then
                 IgnoredChests[chest] = os.clock() + 5
