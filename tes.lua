@@ -6,12 +6,18 @@ getgenv().Settings = {
     ["Chest Touch Radius"] = 8; -- khoảng cách bắt đầu firetouch chest
     ["TP Bypass"] = true;
     ["TP Bypass Distance"] = 1000;
-    ["TP Bypass Max Attempts"] = 3;
+    ["TP Bypass Max Attempts"] = 1;
     ["TP Bypass Min Gain"] = 300;
     ["TP Bypass Respawn Timeout"] = 12;
 
     -- Chỉ CFrame + Jump tới chest thuộc đảo hiện tại.
     ["Chest Same Island Only"] = true;
+    ["Chest Direct CFrame Max Distance"] = 3000;
+    ["Chest Island Radius Margin"] = 350;
+    ["Chest Spawn Classification Max Distance"] = 3500;
+    ["TP Bypass Target Spawn Max Distance"] = 3500;
+    ["TP Bypass Respawn Verify Distance"] = 2500;
+    ["TP Bypass Retry Delay"] = 1.5;
     ["Chest CFrame Timeout"] = 3;
     ["Chest CFrame Interval"] = 0.06;
     ["Chest CFrame Hard Timeout"] = 5;
@@ -22,7 +28,7 @@ getgenv().Settings = {
     -- Server Browser lấy từ bản Cyborg.
     ["Hop Max Pages"] = 200;
     ["Hop Pages Per Batch"] = 50;
-    ["Hop Max Players"] = 5;
+    ["Hop Max Players"] = 8;
     ["Hop Forced Region"] = nil;
     ["Hop Scan Concurrency"] = 50;
     ["Hop Batch Timeout"] = 18;
@@ -55,7 +61,7 @@ end
 
 StarterGui:SetCore("SendNotification", {Title = "Executed", Text = "Loading… Please wait", Duration = 5})
 if not game:IsLoaded() or workspace.DistributedGameTime <= 10 then
-    task.wait(10 - workspace.DistributedGameTime)
+    task.wait(math.max(0, 10 - workspace.DistributedGameTime))
 end
 if not COMMF_ then repeat task.wait(1) until COMMF_ end
 task.spawn(function()
@@ -569,7 +575,7 @@ local ChestBypassState = {
     LastBuild = 0,
     Spawns = {},
     Cache = {
-        Version = 2,
+        Version = 3,
         Spawns = {},
         Locations = {},
     },
@@ -588,7 +594,7 @@ end
 
 -- v2 tránh dùng lại cache cũ bị thiếu đảo hoặc ghi đè spawn trùng tên.
 local ChestBypassCachePath =
-    "chest_bypass_spawns_v2_sea"
+    "chest_bypass_spawns_v3_sea"
     .. tostring(ChestBypassSeaIndex)
     .. ".json"
 
@@ -691,7 +697,7 @@ local function ChestBypassLoadCache()
 
     if not ok
         or type(data) ~= "table"
-        or tonumber(data.Version) ~= 2
+        or tonumber(data.Version) ~= 3
         or type(data.Spawns) ~= "table" then
         return false
     end
@@ -710,7 +716,7 @@ local function ChestBypassSaveCache()
         return false
     end
 
-    ChestBypassState.Cache.Version = 2
+    ChestBypassState.Cache.Version = 3
 
     return pcall(function()
         writefile(
@@ -733,13 +739,18 @@ local function ChestBypassGetObjectPosition(object)
     return ok and position or nil
 end
 
+local function normalizeIslandName(value)
+    if value == nil then return "" end
+    return tostring(value):lower():gsub("[^%w]", "")
+end
+
 local function ChestBypassBuildData(force)
     local now = os.clock()
 
     if ChestBypassState.SpawnBuilt
         and not force
         and now - (ChestBypassState.LastBuild or 0) < 10 then
-        return true
+        return true, #ChestBypassState.Spawns
     end
 
     if not force then
@@ -751,95 +762,79 @@ local function ChestBypassBuildData(force)
     local locationsFolder = origin and origin:FindFirstChild("Locations")
 
     if not spawnsFolder then
-        return ChestBypassState.SpawnBuilt
+        return ChestBypassState.SpawnBuilt, #ChestBypassState.Spawns
     end
 
-    local changed = false
+    local liveSpawns = {}
+    local liveLocations = {}
     local liveCount = 0
 
-    -- Giữ đúng cấu trúc script đầu: mỗi BasePart/Model con của PlayerSpawns
-    -- là một spawn hợp lệ. Chỉ bổ sung đệ quy Folder để không bỏ sót đảo,
-    -- nhưng không lấy các part con bên trong Model làm tên SetLastSpawnPoint.
-    local function scanSpawnContainer(container, groupPath)
-        for _, object in ipairs(container:GetChildren()) do
-            if object:IsA("BasePart") or object:IsA("Model") then
-                local position = ChestBypassGetObjectPosition(object)
-                if position then
-                    local key = tostring(object:GetFullName())
-                    local old = ChestBypassState.Cache.Spawns[key]
-
-                    liveCount = liveCount + 1
-
-                    if not old
-                        or tostring(old.Name or "") ~= tostring(object.Name)
-                        or math.abs((tonumber(old.X or old[1]) or 0) - position.X) > 1
-                        or math.abs((tonumber(old.Y or old[2]) or 0) - position.Y) > 1
-                        or math.abs((tonumber(old.Z or old[3]) or 0) - position.Z) > 1 then
-
-                        ChestBypassState.Cache.Spawns[key] = {
-                            Name = tostring(object.Name),
-                            Group = tostring(groupPath or ""),
+    -- Chỉ đọc đúng cấu trúc gốc: PlayerSpawns/<group>/<spawn>.
+    -- Không quét đệ quy sâu vì có thể nhặt nhầm part/model không phải spawn hợp lệ.
+    for _, group in ipairs(spawnsFolder:GetChildren()) do
+        if group:IsA("Folder") or group:IsA("Model") then
+            for _, spawnObject in ipairs(group:GetChildren()) do
+                if spawnObject:IsA("BasePart") or spawnObject:IsA("Model") then
+                    local position = ChestBypassGetObjectPosition(spawnObject)
+                    if position then
+                        local key = tostring(group.Name) .. "/" .. tostring(spawnObject.Name)
+                        liveSpawns[key] = {
+                            Name = tostring(spawnObject.Name),
+                            Group = tostring(group.Name),
                             X = position.X,
                             Y = position.Y,
                             Z = position.Z,
                         }
-                        changed = true
+                        liveCount = liveCount + 1
                     end
                 end
-            elseif object:IsA("Folder") then
-                local nextGroup =
-                    tostring(groupPath or "")
-                    .. "/"
-                    .. tostring(object.Name)
-                scanSpawnContainer(object, nextGroup)
             end
-        end
-    end
-
-    for _, topFolder in ipairs(spawnsFolder:GetChildren()) do
-        if topFolder:IsA("Folder") then
-            scanSpawnContainer(topFolder, topFolder.Name)
-        elseif topFolder:IsA("BasePart") or topFolder:IsA("Model") then
-            scanSpawnContainer(spawnsFolder, "PlayerSpawns")
-            break
+        elseif group:IsA("BasePart") then
+            local position = group.Position
+            local key = "PlayerSpawns/" .. tostring(group.Name)
+            liveSpawns[key] = {
+                Name = tostring(group.Name),
+                Group = "PlayerSpawns",
+                X = position.X,
+                Y = position.Y,
+                Z = position.Z,
+            }
+            liveCount = liveCount + 1
         end
     end
 
     if locationsFolder then
         for _, location in ipairs(locationsFolder:GetChildren()) do
             if location:IsA("BasePart") then
-                local mesh = location:FindFirstChild("Mesh")
-                local radius = location.Size.X / 2
-
-                if mesh and mesh:IsA("SpecialMesh") then
-                    radius = mesh.Scale.X * location.Size.X / 2
+                local radius = math.max(location.Size.X, location.Size.Z) / 2
+                local mesh = location:FindFirstChildWhichIsA("SpecialMesh")
+                if mesh then
+                    radius = math.max(
+                        mesh.Scale.X * location.Size.X,
+                        mesh.Scale.Z * location.Size.Z
+                    ) / 2
                 end
-
-                local old = ChestBypassState.Cache.Locations[location.Name]
-                if not old
-                    or math.abs((tonumber(old[1]) or 0) - location.Position.X) > 1
-                    or math.abs((tonumber(old[2]) or 0) - location.Position.Y) > 1
-                    or math.abs((tonumber(old[3]) or 0) - location.Position.Z) > 1
-                    or math.abs((tonumber(old[4]) or 0) - radius) > 1 then
-
-                    ChestBypassState.Cache.Locations[location.Name] = {
-                        location.Position.X,
-                        location.Position.Y,
-                        location.Position.Z,
-                        radius,
-                    }
-                    changed = true
-                end
+                liveLocations[location.Name] = {
+                    location.Position.X,
+                    location.Position.Y,
+                    location.Position.Z,
+                    math.clamp(radius, 150, 3500),
+                }
             end
         end
     end
 
+    -- Chỉ thay cache khi live scan có dữ liệu, tránh giữ entry rác của bản cũ.
+    if liveCount > 0 then
+        ChestBypassState.Cache.Spawns = liveSpawns
+    end
+    if next(liveLocations) ~= nil then
+        ChestBypassState.Cache.Locations = liveLocations
+    end
+
     ChestBypassState.LastBuild = now
     ChestBypassRebuild()
-
-    if changed then
-        ChestBypassSaveCache()
-    end
+    ChestBypassSaveCache()
 
     return ChestBypassState.SpawnBuilt, liveCount
 end
@@ -867,26 +862,125 @@ local function ChestBypassGetNearestSpawn(position, forceRefresh)
     return nearestData, nearestDistance
 end
 
+local function ChestBypassGetLocationAt(position)
+    if typeof(position) ~= "Vector3" then
+        return nil
+    end
+
+    local margin = tonumber(getgenv().Settings["Chest Island Radius Margin"]) or 350
+    local best
+    local bestScore = math.huge
+
+    for name, data in pairs(ChestBypassState.Cache.Locations or {}) do
+        if type(data) == "table" then
+            local x, y, z = tonumber(data[1]), tonumber(data[2]), tonumber(data[3])
+            local radius = tonumber(data[4]) or 150
+            if x and y and z then
+                local center = Vector3.new(x, y, z)
+                local horizontal = Vector3.new(position.X - x, 0, position.Z - z).Magnitude
+                local allowed = math.max(150, radius + margin)
+                if horizontal <= allowed then
+                    local score = horizontal / allowed
+                    if score < bestScore then
+                        bestScore = score
+                        best = {
+                            Id = "location:" .. normalizeIslandName(name),
+                            Name = tostring(name),
+                            Source = "Location",
+                            Center = center,
+                            Radius = allowed,
+                        }
+                    end
+                end
+            end
+        end
+    end
+
+    return best
+end
+
+local function ChestBypassGetIslandContext(position, allowPlayerAttribute)
+    if typeof(position) ~= "Vector3" then
+        return nil, math.huge
+    end
+
+    if allowPlayerAttribute then
+        local currentLocation = LocalPlayer:GetAttribute("CurrentLocation")
+        local normalized = normalizeIslandName(currentLocation)
+        if normalized ~= "" then
+            local margin = tonumber(
+                getgenv().Settings["Chest Island Radius Margin"]
+            ) or 350
+
+            for locationName, data in pairs(ChestBypassState.Cache.Locations or {}) do
+                if normalizeIslandName(locationName) == normalized
+                    and type(data) == "table" then
+                    local x, y, z = tonumber(data[1]), tonumber(data[2]), tonumber(data[3])
+                    local radius = tonumber(data[4]) or 150
+                    if x and y and z then
+                        local horizontal = Vector3.new(
+                            position.X - x,
+                            0,
+                            position.Z - z
+                        ).Magnitude
+                        local allowed = math.max(150, radius + margin)
+                        if horizontal <= allowed then
+                            return {
+                                Id = "location:" .. normalized,
+                                Name = tostring(locationName),
+                                Source = "CurrentLocation",
+                                Center = Vector3.new(x, y, z),
+                                Radius = allowed,
+                            }, horizontal
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local location = ChestBypassGetLocationAt(position)
+    if location then
+        return location, 0
+    end
+
+    local spawn, distance = ChestBypassGetNearestSpawn(position, false)
+    local maxSpawnDistance = tonumber(
+        getgenv().Settings["Chest Spawn Classification Max Distance"]
+    ) or 3500
+
+    if spawn and distance <= maxSpawnDistance then
+        return {
+            Id = "spawn:" .. normalizeIslandName(spawn.Name),
+            Name = tostring(spawn.Name),
+            Source = "Spawn",
+            Center = spawn.Position,
+            Radius = maxSpawnDistance,
+            Spawn = spawn,
+        }, distance
+    end
+
+    return nil, distance
+end
+
 local function ChestBypassGetCurrentIsland(root)
     if not root or not root.Parent then
         return nil, math.huge
     end
-
-    local nearest, distance = ChestBypassGetNearestSpawn(root.Position, false)
-    return nearest and nearest.Name or nil, distance
+    return ChestBypassGetIslandContext(root.Position, true)
 end
 
-local function ChestBypassIsChestOnIsland(chest, islandName)
+local function ChestBypassIsChestOnIsland(chest, islandContext)
     if getgenv().Settings["Chest Same Island Only"] == false then
         return true
     end
 
-    if not islandName or not chest or not chest:IsA("BasePart") then
+    if not islandContext or not chest or not chest:IsA("BasePart") then
         return false
     end
 
-    local nearest = ChestBypassGetNearestSpawn(chest.Position, false)
-    return nearest ~= nil and tostring(nearest.Name) == tostring(islandName)
+    local chestContext = ChestBypassGetIslandContext(chest.Position, false)
+    return chestContext ~= nil and chestContext.Id == islandContext.Id
 end
 
 local function ChestBypassSetLastSpawnScript(character, disabled)
@@ -933,109 +1027,154 @@ end
 
 local function ChestBypassStep(target)
     if ChestBypassIsBlocked() then
-        return false
+        return false, "blocked"
     end
+
     local targetPosition = typeof(target) == "CFrame" and target.Position or target
     if typeof(targetPosition) ~= "Vector3" then
-        return false
+        return false, "invalid_target"
     end
+
     local char, hum, root = ChestBypassGetCharacter(5)
     if not char or not hum or not root then
-        return false
+        return false, "character_missing"
     end
+
     local threshold = tonumber(getgenv().Settings["TP Bypass Distance"]) or 1000
     local originalDistance = (root.Position - targetPosition).Magnitude
     if originalDistance < threshold then
-        return false
-    end
-    if ChestBypassSeaIndex == 3 and (Vector3.new(11256, -2138, 9888) - targetPosition).Magnitude < 1500 then
-        return false
-    end
-    if not ChestBypassBuildData(false) then
-        return false
+        return false, "below_threshold"
     end
 
-    -- Nếu cache chưa có spawn hợp lý gần mục tiêu, quét live lại trước khi chọn.
-    local nearestTargetSpawn, nearestTargetDistance =
-        ChestBypassGetNearestSpawn(targetPosition, false)
-    if not nearestTargetSpawn or nearestTargetDistance > 6000 then
-        ChestBypassBuildData(true)
+    if ChestBypassSeaIndex == 3
+        and (Vector3.new(11256, -2138, 9888) - targetPosition).Magnitude < 1500 then
+        return false, "blocked_sea3_zone"
     end
+
+    ChestBypassBuildData(true)
+    if not ChestBypassState.SpawnBuilt then
+        return false, "no_spawns"
+    end
+
+    local targetIsland = ChestBypassGetIslandContext(targetPosition, false)
+    local currentIsland = ChestBypassGetIslandContext(root.Position, true)
+    local maxTargetSpawnDistance = tonumber(
+        getgenv().Settings["TP Bypass Target Spawn Max Distance"]
+    ) or 3500
+    local minGain = tonumber(getgenv().Settings["TP Bypass Min Gain"]) or 300
+
+    local candidates = {}
+    for _, spawnData in ipairs(ChestBypassState.Spawns) do
+        local spawnToTarget = (spawnData.Position - targetPosition).Magnitude
+        local spawnIsland = ChestBypassGetIslandContext(spawnData.Position, false)
+        local targetMatches = not targetIsland
+            or (spawnIsland and spawnIsland.Id == targetIsland.Id)
+
+        if targetMatches and spawnToTarget <= maxTargetSpawnDistance then
+            candidates[#candidates + 1] = {
+                Data = spawnData,
+                SpawnToTarget = spawnToTarget,
+            }
+        end
+    end
+
+    table.sort(candidates, function(a, b)
+        return a.SpawnToTarget < b.SpawnToTarget
+    end)
+
+    if #candidates == 0 then
+        return false, "no_target_spawn"
+    end
+
     ChestBypassState.Busy = true
     Tween(false)
-    local success, result = pcall(function()
-        local candidates = {}
-        for _, spawnData in ipairs(ChestBypassState.Spawns) do
-            candidates[#candidates + 1] = spawnData
-        end
-        table.sort(candidates, function(a, b)
-            return (a.Position - targetPosition).Magnitude < (b.Position - targetPosition).Magnitude
-        end)
-        local minGain = tonumber(getgenv().Settings["TP Bypass Min Gain"]) or 300
+
+    local success, result, resultReason = pcall(function()
         ChestBypassSetLastSpawnScript(char, true)
         task.wait()
-        for _, spawnData in ipairs(candidates) do
+
+        for _, candidate in ipairs(candidates) do
+            local spawnData = candidate.Data
             char, hum, root = ChestBypassGetCharacter(3)
             if not char or not hum or not root then
                 break
             end
+
             local currentDistance = (root.Position - targetPosition).Magnitude
-            local spawnToTarget = (spawnData.Position - targetPosition).Magnitude
             local playerToSpawn = (root.Position - spawnData.Position).Magnitude
-            if spawnToTarget + minGain < currentDistance and playerToSpawn >= 300 then
-                SetText("Collect Chests | TP Bypass: " .. tostring(spawnData.Name))
+            local spawnIsland = ChestBypassGetIslandContext(spawnData.Position, false)
+            local sameAsCurrent = currentIsland and spawnIsland
+                and currentIsland.Id == spawnIsland.Id
+
+            if not sameAsCurrent
+                and candidate.SpawnToTarget + minGain < currentDistance
+                and playerToSpawn >= 300 then
+
+                SetText(
+                    "Collect Chests | TP Bypass: "
+                    .. tostring(spawnData.Name)
+                    .. " | target "
+                    .. tostring(targetIsland and targetIsland.Name or "Unknown")
+                )
+
                 local invoked = pcall(function()
                     COMMF_:InvokeServer("SetLastSpawnPoint", spawnData.Name)
                 end)
+
                 if invoked and ChestBypassWaitSpawn(spawnData.Name, 2) then
                     local oldCharacter = char
-                    pcall(function()
-                        hum.Health = 0
-                    end)
+                    pcall(function() hum.Health = 0 end)
+
                     local _, _, newRoot = ChestBypassWaitRespawn(oldCharacter)
                     if newRoot then
-                        return (newRoot.Position - targetPosition).Magnitude <= originalDistance - minGain
+                        local verifyDistance = tonumber(
+                            getgenv().Settings["TP Bypass Respawn Verify Distance"]
+                        ) or 2500
+                        local toSpawn = (newRoot.Position - spawnData.Position).Magnitude
+                        local newDistance = (newRoot.Position - targetPosition).Magnitude
+                        local newIsland = ChestBypassGetIslandContext(newRoot.Position, true)
+                        local islandOk = not spawnIsland
+                            or (newIsland and newIsland.Id == spawnIsland.Id)
+
+                        if toSpawn <= verifyDistance
+                            and newDistance <= originalDistance - minGain
+                            and islandOk then
+                            return true, "respawn_success"
+                        end
+
+                        return false, "respawn_verify_failed"
                     end
-                    return false
+
+                    return false, "respawn_timeout"
                 end
             end
         end
-        ChestBypassSetLastSpawnScript(LocalPlayer.Character or char, false)
-        return false
+
+        return false, "no_better_spawn"
     end)
+
+    ChestBypassSetLastSpawnScript(LocalPlayer.Character or char, false)
     ChestBypassState.Busy = false
+
     if not success then
         warn("Chest TP Bypass error:", result)
-        ChestBypassSetLastSpawnScript(LocalPlayer.Character, false)
-        return false
+        return false, "bypass_error"
     end
-    return result == true
+
+    return result == true, resultReason
 end
 
 local function ChestBypassTo(target)
     if getgenv().Settings["TP Bypass"] == false then
-        return false
+        return false, "disabled"
     end
-    local targetPosition = typeof(target) == "CFrame" and target.Position or target
-    if typeof(targetPosition) ~= "Vector3" then
-        return false
-    end
-    local maxAttempts = tonumber(getgenv().Settings["TP Bypass Max Attempts"]) or 3
-    local threshold = tonumber(getgenv().Settings["TP Bypass Distance"]) or 1000
-    local changed = false
-    for _ = 1, maxAttempts do
-        local _, _, root = ChestBypassGetCharacter(5)
-        if not root or (root.Position - targetPosition).Magnitude < threshold then
-            break
-        end
-        if not ChestBypassStep(targetPosition) then
-            break
-        end
-        changed = true
-        task.wait(0.15)
-    end
+
+    -- Mỗi lần gọi chỉ đổi spawn + reset đúng một lần rồi quay lại vòng farm
+    -- để nhận diện lại đảo/chest. Không chain 2-3 lần khiến nhân vật nhảy qua
+    -- nhiều đảo trong một lượt.
+    local ok, reason = ChestBypassStep(target)
     ChestBypassGetCharacter(3)
-    return changed
+    return ok, reason
 end
 
 getgenv().ChestBypassTP = ChestBypassTo
@@ -1089,6 +1228,20 @@ local function CFrameJumpChest(chest)
 
     local _, _, startRoot = ChestBypassGetCharacter(1)
     local lockedIsland = startRoot and ChestBypassGetCurrentIsland(startRoot) or nil
+    local initialDistance = startRoot and (startRoot.Position - chest.Position).Magnitude or math.huge
+    local maxDirectDistance = tonumber(
+        getgenv().Settings["Chest Direct CFrame Max Distance"]
+    ) or 3000
+
+    if not startRoot then
+        return false, "character_missing"
+    end
+
+    -- Chốt an toàn tuyệt đối: dù island detect sai cũng không CFrame tới chest
+    -- cách xa quá giới hạn, nên không thể bay sang đảo khác.
+    if initialDistance > maxDirectDistance then
+        return false, "distance_guard"
+    end
 
     if getgenv().Settings["Chest Same Island Only"] ~= false
         and (not lockedIsland
@@ -1126,7 +1279,7 @@ local function CFrameJumpChest(chest)
         local ok, err = xpcall(function()
             local startedAt = os.clock()
             local lastMovedAt = startedAt
-            local lastDistance = math.huge
+            local lastDistance = initialDistance
             local touched = false
 
             while ChestFarmRuntime.Token == myToken
@@ -1150,46 +1303,46 @@ local function CFrameJumpChest(chest)
                     return
                 end
 
+                local beforeDistance = (root.Position - chest.Position).Magnitude
+                if beforeDistance > maxDirectDistance then
+                    reason = "distance_guard"
+                    return
+                end
+
+                local currentIsland = ChestBypassGetCurrentIsland(root)
+                if getgenv().Settings["Chest Same Island Only"] ~= false
+                    and (not currentIsland or currentIsland.Id ~= lockedIsland.Id) then
+                    reason = "island_changed"
+                    return
+                end
+
                 humanoid.Sit = false
                 humanoid.PlatformStand = false
                 humanoid.Jump = true
-
                 pcall(function()
                     humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                end)
-
-                pcall(function()
                     root.Anchored = false
                     root.AssemblyLinearVelocity = Vector3.zero
                     root.AssemblyAngularVelocity = Vector3.zero
                 end)
 
                 local targetCFrame = chest.CFrame * CFrame.new(0, 2.5, 0)
-
-                -- Ưu tiên đúng kiểu script gốc: CFrame thẳng. PivotTo chỉ là fallback
-                -- một lần khi CFrame bị server/executor trả ngược vị trí.
-                pcall(function()
-                    root.CFrame = targetCFrame
-                end)
-
+                pcall(function() root.CFrame = targetCFrame end)
                 task.wait(0.04)
 
                 local distance = (root.Position - chest.Position).Magnitude
                 if distance > touchRadius + 8 then
-                    pcall(function()
-                        char:PivotTo(targetCFrame)
-                    end)
+                    -- Fallback chỉ được phép vì khoảng cách ban đầu đã qua guard.
+                    pcall(function() char:PivotTo(targetCFrame) end)
                     task.wait(0.03)
                     distance = (root.Position - chest.Position).Magnitude
                 end
 
                 ChestFarmRuntime.LastDistance = distance
 
-                if distance + 10 < lastDistance then
+                if distance + 5 < lastDistance then
                     lastMovedAt = os.clock()
                     ChestFarmRuntime.LastProgress = lastMovedAt
-                    lastDistance = distance
-                elseif lastDistance == math.huge then
                     lastDistance = distance
                 end
 
@@ -1201,7 +1354,6 @@ local function CFrameJumpChest(chest)
                 if distance <= touchRadius + 4 then
                     touched = true
                     ChestFarmRuntime.LastProgress = os.clock()
-
                     pcall(function()
                         firetouchinterest(root, chest, 0)
                         firetouchinterest(chest, root, 0)
@@ -1220,17 +1372,12 @@ local function CFrameJumpChest(chest)
                 end
 
                 if touched and os.clock() - startedAt >= skipDelay then
-                    -- Giữ cách xử lý ghost chest của bản đầu, nhưng chỉ thực hiện
-                    -- sau khi đã thật sự tới gần và firetouch.
-                    pcall(function()
-                        chest.CanTouch = false
-                    end)
+                    pcall(function() chest.CanTouch = false end)
                     result = true
                     reason = "touch_complete"
                     return
                 end
 
-                -- CFrame bị trả ngược/không đổi vị trí: thoát sớm để chọn chest khác.
                 if distance > 25 and os.clock() - lastMovedAt >= noMoveTimeout then
                     reason = "cframe_rejected"
                     return
@@ -1363,7 +1510,7 @@ task.spawn(function()
     end
 end)
 
-local function GetNearestChest(islandName)
+local function GetNearestChest(islandContext, outsideOnly)
     local _, _, root = ChestBypassGetCharacter(3)
     if not root then
         return nil, math.huge
@@ -1381,11 +1528,13 @@ local function GetNearestChest(islandName)
             and chest.Name:find("Chest") then
 
             local ignoredUntil = IgnoredChests[chest]
-            local sameIsland =
-                islandName == nil
-                or ChestBypassIsChestOnIsland(chest, islandName)
+            local onIsland = islandContext ~= nil
+                and ChestBypassIsChestOnIsland(chest, islandContext)
+            local islandOk = islandContext == nil
+                or (outsideOnly and not onIsland)
+                or (not outsideOnly and onIsland)
 
-            if sameIsland and (not ignoredUntil or now >= ignoredUntil) then
+            if islandOk and (not ignoredUntil or now >= ignoredUntil) then
                 local distance = (chest.Position - root.Position).Magnitude
                 if distance < nearestDistance then
                     nearest = chest
@@ -1400,12 +1549,11 @@ end
 
 FarmBeli = (function(shouldStop)
     if type(shouldStop) ~= "function" then
-        shouldStop = function()
-            return false
-        end
+        shouldStop = function() return false end
     end
 
     local sessionCount = 0
+    local lastBypassAt = 0
 
     if not ChestBypassGetCharacter(5) then
         SetText("Waiting character before chest farm")
@@ -1427,40 +1575,53 @@ FarmBeli = (function(shouldStop)
         if not char or not hum or not root then
             task.wait(0.5)
         else
-            -- Chỉ lấy chest thuộc đảo đang đứng.
             local currentIsland = ChestBypassGetCurrentIsland(root)
-            local chest, distance = GetNearestChest(currentIsland)
-            local threshold =
-                tonumber(getgenv().Settings["TP Bypass Distance"])
-                or 1000
+            local chest, distance = GetNearestChest(currentIsland, false)
+            local threshold = tonumber(getgenv().Settings["TP Bypass Distance"]) or 1000
 
-            -- Đảo hiện tại hết chest: chỉ dùng chest toàn map làm đích đổi spawn.
-            -- Sau khi hồi sinh sẽ tìm lại chest trên đảo mới, không CFrame target cũ.
+            -- Chỉ đổi spawn khi đảo hiện tại thật sự hết chest.
             if not chest then
-                local bypassTarget, bypassDistance = GetNearestChest(nil)
+                local bypassTarget, bypassDistance = GetNearestChest(currentIsland, true)
 
                 if not bypassTarget then
                     break
                 end
 
+                local retryDelay = tonumber(
+                    getgenv().Settings["TP Bypass Retry Delay"]
+                ) or 1.5
+
                 if getgenv().Settings["TP Bypass"] ~= false
-                    and bypassDistance >= threshold then
+                    and bypassDistance >= threshold
+                    and os.clock() - lastBypassAt >= retryDelay then
 
                     SetText(
                         "Collect Chests | TP Bypass to island"
-                        .. "\nSpawns detected: "
+                        .. "\nCurrent: "
+                        .. tostring(currentIsland and currentIsland.Name or "Unknown")
+                        .. " | Spawns: "
                         .. tostring(#ChestBypassState.Spawns)
                         .. " | Distance: "
                         .. tostring(math.floor(bypassDistance))
                     )
 
-                    ChestBypassTo(bypassTarget.CFrame)
+                    lastBypassAt = os.clock()
+                    local bypassed, bypassReason = ChestBypassTo(bypassTarget.CFrame)
                     char, hum, root = ChestBypassGetCharacter(5)
 
-                    if root then
+                    if bypassed and root then
                         currentIsland = ChestBypassGetCurrentIsland(root)
-                        chest, distance = GetNearestChest(currentIsland)
+                        chest, distance = GetNearestChest(currentIsland, false)
+                    else
+                        IgnoredChests[bypassTarget] = os.clock() + 15
+                        SetText(
+                            "TP Bypass skipped | "
+                            .. tostring(bypassReason or "failed")
+                        )
                     end
+                else
+                    -- Target khác đảo nhưng quá gần/đang cooldown: không CFrame nó.
+                    IgnoredChests[bypassTarget] = os.clock() + 8
                 end
             end
 
@@ -1475,60 +1636,75 @@ FarmBeli = (function(shouldStop)
                 and hum
                 and hum.Health > 0
                 and root
-                and ChestBypassIsChestOnIsland(
-                    chest,
-                    ChestBypassGetCurrentIsland(root)
-                ) then
+                and currentIsland
+                and ChestBypassIsChestOnIsland(chest, currentIsland) then
 
                 local newDistance = (chest.Position - root.Position).Magnitude
+                local maxDirectDistance = tonumber(
+                    getgenv().Settings["Chest Direct CFrame Max Distance"]
+                ) or 3000
 
-                SetText(
-                    "Collect Chests | CFrame + Jump"
-                    .. "\nIsland: "
-                    .. tostring(ChestBypassGetCurrentIsland(root) or "Unknown")
-                    .. " | "
-                    .. tostring(sessionCount)
-                    .. "/"
-                    .. tostring(all)
-                    .. "/"
-                    .. tostring(getgenv().Settings["Max Chests"])
-                    .. " | Distance: "
-                    .. tostring(math.floor(newDistance))
-                )
-
-                local attempted, attemptReason = CFrameJumpChest(chest)
-
-                if attempted and (not chest.Parent or not chest.CanTouch) then
-                    sessionCount = sessionCount + 1
-                    all = all + 1
-                    IgnoredChests[chest] = nil
-                    ChestFailCounts[chest] = nil
-                else
-                    local fails = (ChestFailCounts[chest] or 0) + 1
-                    ChestFailCounts[chest] = fails
-
-                    local hardFailure = attemptReason == "hard_timeout"
-                        or attemptReason == "watchdog"
-                        or attemptReason == "cframe_rejected"
-                        or tostring(attemptReason):find("worker_error", 1, true) ~= nil
-
-                    local ignoreSeconds
-                    if hardFailure then
-                        ignoreSeconds = tonumber(
-                            getgenv().Settings["Chest Stuck Ignore"]
-                        ) or 45
-                    else
-                        ignoreSeconds = fails >= 3 and 60 or 8
-                    end
-
-                    IgnoredChests[chest] = os.clock() + ignoreSeconds
+                if newDistance > maxDirectDistance then
+                    IgnoredChests[chest] = os.clock() + 15
                     SetText(
-                        "Chest skipped | "
-                        .. tostring(attemptReason or "unknown")
-                        .. " | retry after "
-                        .. tostring(math.floor(ignoreSeconds))
-                        .. "s"
+                        "Chest blocked | distance guard"
+                        .. "\nIsland: "
+                        .. tostring(currentIsland.Name)
+                        .. " | Distance: "
+                        .. tostring(math.floor(newDistance))
                     )
+                else
+                    SetText(
+                        "Collect Chests | CFrame + Jump"
+                        .. "\nIsland: "
+                        .. tostring(currentIsland.Name or "Unknown")
+                        .. " | "
+                        .. tostring(sessionCount)
+                        .. "/"
+                        .. tostring(all)
+                        .. "/"
+                        .. tostring(getgenv().Settings["Max Chests"])
+                        .. " | Distance: "
+                        .. tostring(math.floor(newDistance))
+                    )
+
+                    local attempted, attemptReason = CFrameJumpChest(chest)
+
+                    if attempted and (not chest.Parent or not chest.CanTouch) then
+                        sessionCount = sessionCount + 1
+                        all = all + 1
+                        IgnoredChests[chest] = nil
+                        ChestFailCounts[chest] = nil
+                    else
+                        local fails = (ChestFailCounts[chest] or 0) + 1
+                        ChestFailCounts[chest] = fails
+
+                        local hardFailure = attemptReason == "hard_timeout"
+                            or attemptReason == "watchdog"
+                            or attemptReason == "cframe_rejected"
+                            or attemptReason == "distance_guard"
+                            or attemptReason == "different_island"
+                            or attemptReason == "island_changed"
+                            or tostring(attemptReason):find("worker_error", 1, true) ~= nil
+
+                        local ignoreSeconds
+                        if hardFailure then
+                            ignoreSeconds = tonumber(
+                                getgenv().Settings["Chest Stuck Ignore"]
+                            ) or 45
+                        else
+                            ignoreSeconds = fails >= 3 and 60 or 8
+                        end
+
+                        IgnoredChests[chest] = os.clock() + ignoreSeconds
+                        SetText(
+                            "Chest skipped | "
+                            .. tostring(attemptReason or "unknown")
+                            .. " | retry after "
+                            .. tostring(math.floor(ignoreSeconds))
+                            .. "s"
+                        )
+                    end
                 end
             elseif chest then
                 IgnoredChests[chest] = os.clock() + 5
@@ -1576,7 +1752,7 @@ spawn(function()
                     task.wait(5)
                 else
                     FarmBeli(function()
-                        return all >= getgenv().Settings["Max Chests"] or CheckTool("Fist of Darkness") or CheckTool("Darkbeard")
+                        return all >= getgenv().Settings["Max Chests"] or CheckTool("Fist of Darkness") or CheckMonster("Darkbeard")
                     end)
                 end
             else TeleportSea(2, "Travel to sea 2 for farm Dark Fragments")
