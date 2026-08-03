@@ -5,6 +5,7 @@ getgenv().Settings = {
     ["Chest CFrame Timeout"] = 3; -- tối đa bao nhiêu giây xử lý một chest
     ["Chest CFrame Interval"] = 0.05; -- nhịp CFrame + Jump + firetouch
     ["Chest Touch Radius"] = 10; -- bán kính xác nhận trước khi firetouch
+    ["Chest Same Island Only"] = true; -- chỉ CFrame tới chest thuộc đúng đảo hiện tại
     ["TP Bypass"] = true;
     ["TP Bypass Distance"] = 1000;
     ["TP Bypass Max Attempts"] = 3;
@@ -498,6 +499,47 @@ local function ChestBypassBuildData(force)
     return ChestBypassState.SpawnBuilt
 end
 
+-- Xác định đảo theo PlayerSpawn gần nhất. Cách này giúp khóa CFrame trong đúng đảo
+-- sau khi TP bypass đổi spawn và nhân vật vừa hồi sinh.
+local function ChestBypassGetNearestSpawn(position)
+    if typeof(position) ~= "Vector3" then
+        return nil, math.huge
+    end
+    if not ChestBypassState.SpawnBuilt then
+        ChestBypassBuildData(false)
+    end
+    local nearestName = nil
+    local nearestDistance = math.huge
+    for _, spawnData in ipairs(ChestBypassState.Spawns) do
+        if spawnData and typeof(spawnData.Position) == "Vector3" then
+            local distance = (spawnData.Position - position).Magnitude
+            if distance < nearestDistance then
+                nearestName = tostring(spawnData.Name)
+                nearestDistance = distance
+            end
+        end
+    end
+    return nearestName, nearestDistance
+end
+
+local function ChestBypassGetCurrentIsland(root)
+    if not root or not root.Parent then
+        return nil, math.huge
+    end
+    return ChestBypassGetNearestSpawn(root.Position)
+end
+
+local function ChestBypassIsChestOnIsland(chest, islandName)
+    if getgenv().Settings["Chest Same Island Only"] == false or not islandName then
+        return true
+    end
+    if not chest or not chest:IsA("BasePart") then
+        return false
+    end
+    local chestIsland = ChestBypassGetNearestSpawn(chest.Position)
+    return chestIsland ~= nil and chestIsland == islandName
+end
+
 local function ChestBypassSetLastSpawnScript(character, disabled)
     local scriptObject = character and character:FindFirstChild("LastSpawnPoint")
     if scriptObject then
@@ -659,6 +701,14 @@ local function CFrameJumpChest(chest)
         return false
     end
 
+    -- Khóa đảo trước khi CFrame. Chest khác đảo sẽ bị từ chối hoàn toàn.
+    local _, _, startRoot = ChestBypassGetCharacter(1)
+    local lockedIsland = startRoot and ChestBypassGetCurrentIsland(startRoot) or nil
+    if getgenv().Settings["Chest Same Island Only"] ~= false
+        and (not lockedIsland or not ChestBypassIsChestOnIsland(chest, lockedIsland)) then
+        return false
+    end
+
     -- Dừng mọi tween đang chạy trước khi CFrame thẳng vào chest.
     Tween(false)
 
@@ -813,7 +863,7 @@ end
 local all = 0
 local IgnoredChests = setmetatable({}, {__mode = "k"})
 
-local function GetNearestChest()
+local function GetNearestChest(islandName)
     local _, _, root = ChestBypassGetCharacter(3)
     if not root then
         return nil, math.huge
@@ -828,7 +878,8 @@ local function GetNearestChest()
             and chest.CanTouch
             and chest.Name:find("Chest") then
             local ignoredUntil = IgnoredChests[chest]
-            if not ignoredUntil or now >= ignoredUntil then
+            local sameIsland = islandName == nil or ChestBypassIsChestOnIsland(chest, islandName)
+            if sameIsland and (not ignoredUntil or now >= ignoredUntil) then
                 local distance = (chest.Position - root.Position).Magnitude
                 if distance < nearestDistance then
                     nearest = chest
@@ -863,30 +914,65 @@ FarmBeli = (function(shouldStop)
         if not char or not hum or not root then
             task.wait(0.5)
         else
-            local chest, distance = GetNearestChest()
-            if not chest then
-                break
-            end
+            -- Ưu tiên chest trên đúng đảo hiện tại. Nếu đảo đã hết chest mới lấy
+            -- một chest toàn bản đồ làm đích TP bypass. Sau respawn phải tìm lại
+            -- chest theo đảo mới, không CFrame tới chest mục tiêu cũ.
+            local currentIsland = ChestBypassGetCurrentIsland(root)
+            local chest, distance = GetNearestChest(currentIsland)
             local threshold = tonumber(getgenv().Settings["TP Bypass Distance"]) or 1000
-            if getgenv().Settings["TP Bypass"] ~= false and distance >= threshold then
+
+            if not chest then
+                local bypassTarget, bypassDistance = GetNearestChest(nil)
+                if not bypassTarget then
+                    break
+                end
+                if getgenv().Settings["TP Bypass"] ~= false and bypassDistance >= threshold then
+                    SetText(
+                        "Collect Chests | TP Bypass to island\nDistance: "
+                        .. math.floor(bypassDistance)
+                        .. " | "
+                        .. all
+                        .. "/"
+                        .. getgenv().Settings["Max Chests"]
+                    )
+                    ChestBypassTo(bypassTarget.CFrame)
+                    char, hum, root = ChestBypassGetCharacter(5)
+                    if root then
+                        currentIsland = ChestBypassGetCurrentIsland(root)
+                        chest, distance = GetNearestChest(currentIsland)
+                    end
+                end
+            elseif getgenv().Settings["TP Bypass"] ~= false and distance >= threshold then
                 SetText(
-                    "Collect Chests | TP Bypass\nDistance: "
+                    "Collect Chests | TP Bypass\nIsland: "
+                    .. tostring(currentIsland or "Unknown")
+                    .. " | Distance: "
                     .. math.floor(distance)
-                    .. " | "
-                    .. all
-                    .. "/"
-                    .. getgenv().Settings["Max Chests"]
                 )
                 ChestBypassTo(chest.CFrame)
                 char, hum, root = ChestBypassGetCharacter(5)
+                if root then
+                    currentIsland = ChestBypassGetCurrentIsland(root)
+                    chest, distance = GetNearestChest(currentIsland)
+                end
+            end
+
+            -- Không có chest trên đảo vừa đứng thì bỏ vòng, tuyệt đối không CFrame
+            -- xuyên sang chest thuộc đảo khác.
+            if not chest then
+                task.wait(0.2)
+                break
             end
             if CheckTool("Fist of Darkness") or CheckMonster("Darkbeard") then
                 break
             end
-            if chest and chest.Parent and chest.CanTouch and char and hum and hum.Health > 0 and root then
+            if chest and chest.Parent and chest.CanTouch and char and hum and hum.Health > 0 and root
+                and ChestBypassIsChestOnIsland(chest, ChestBypassGetCurrentIsland(root)) then
                 local newDistance = (chest.Position - root.Position).Magnitude
                 SetText(
-                    "Collect Chests | CFrame + Jump: "
+                    "Collect Chests | CFrame + Jump\nIsland: "
+                    .. tostring(ChestBypassGetCurrentIsland(root) or "Unknown")
+                    .. " | "
                     .. sessionCount
                     .. "/"
                     .. all
