@@ -2,15 +2,26 @@ getgenv().Settings = {
     ["Max Chests"] = 50; -- if you collected 50 chests, hop server
     ["Skip Chest Delay"] = 1; -- (0.4 - 2)
     ["Black Screen"] = false;
-    ["Chest CFrame Timeout"] = 3; -- tối đa bao nhiêu giây xử lý một chest
-    ["Chest CFrame Interval"] = 0.05; -- nhịp CFrame + Jump + firetouch
-    ["Chest Touch Radius"] = 10; -- bán kính xác nhận trước khi firetouch
-    ["Chest Same Island Only"] = true; -- chỉ CFrame tới chest thuộc đúng đảo hiện tại
+    ["Chest Tween Speed"] = 325; -- tốc độ tween thẳng vào chest, tăng nếu muốn nhanh hơn
+    ["Chest Touch Radius"] = 8; -- khoảng cách bắt đầu firetouch chest
     ["TP Bypass"] = true;
     ["TP Bypass Distance"] = 1000;
     ["TP Bypass Max Attempts"] = 3;
     ["TP Bypass Min Gain"] = 300;
     ["TP Bypass Respawn Timeout"] = 12;
+
+    -- Chỉ CFrame + Jump tới chest thuộc đảo hiện tại.
+    ["Chest Same Island Only"] = true;
+    ["Chest CFrame Timeout"] = 3;
+    ["Chest CFrame Interval"] = 0.05;
+
+    -- Server Browser lấy từ bản Cyborg.
+    ["Hop Max Pages"] = 200;
+    ["Hop Pages Per Batch"] = 50;
+    ["Hop Max Players"] = 5;
+    ["Hop Forced Region"] = nil;
+    ["Hop Scan Concurrency"] = 50;
+    ["Hop Batch Timeout"] = 18;
 };
 PlaceId, JobId = game.PlaceId, game.JobId
 CoreGUI = game:GetService("CoreGui")
@@ -205,63 +216,291 @@ FastAttack = (function(x)
     lastCallFA = tick()
 end)
 
+local lastHop, inHopPP = tick(), false
+
+local HopState = {
+    NextPage = 1,
+    StartPage = 0,
+    EndPage = 0,
+    CurrentPage = 0,
+    RequestedPages = 0,
+    CompletedPages = 0,
+    FailedPages = 0,
+    Candidates = 0,
+    TimedOut = false,
+}
+
 function IfTableHaveIndex(j)
-    for _ in j do
+    if type(j) ~= "table" then
+        return false
+    end
+    for _ in pairs(j) do
         return true
     end
+    return false
 end
 
-local LastServersDataPulled, CachedServers
-function GetServers()
-    if LastServersDataPulled then
-        if os.time() - LastServersDataPulled < 60 then
-            return CachedServers
-        end
+local function getHopConfig(maxPlayersArg, forcedRegionArg)
+    local settings = getgenv().Settings or {}
+
+    local maxPages = math.max(
+        1,
+        math.floor(tonumber(settings["Hop Max Pages"]) or 200)
+    )
+
+    local pagesPerBatch = math.max(
+        1,
+        math.floor(tonumber(settings["Hop Pages Per Batch"]) or 50)
+    )
+    pagesPerBatch = math.min(pagesPerBatch, maxPages)
+
+    local maxPlayers =
+        tonumber(settings["Hop Max Players"])
+        or tonumber(maxPlayersArg)
+        or 8
+
+    local forcedRegion = settings["Hop Forced Region"]
+    if forcedRegion == nil or tostring(forcedRegion) == "" then
+        forcedRegion = forcedRegionArg
+    end
+    if forcedRegion ~= nil and tostring(forcedRegion) == "" then
+        forcedRegion = nil
     end
 
-    for i = 1, 100, 1 do
-        local data = ReplicatedStorage:WaitForChild("__ServerBrowser"):InvokeServer(i)
-        if IfTableHaveIndex(data) then
-            LastServersDataPulled = os.time()
-            CachedServers = data
-            return data
-        end
-    end
+    local concurrency = math.max(
+        1,
+        math.floor(tonumber(settings["Hop Scan Concurrency"]) or 50)
+    )
+    concurrency = math.min(concurrency, pagesPerBatch)
+
+    local batchTimeout = math.max(
+        3,
+        tonumber(settings["Hop Batch Timeout"]) or 18
+    )
+
+    return {
+        MaxPages = maxPages,
+        PagesPerBatch = pagesPerBatch,
+        MaxPlayers = maxPlayers,
+        ForcedRegion = forcedRegion,
+        Concurrency = concurrency,
+        BatchTimeout = batchTimeout,
+    }
 end
 
-HopServer = function(MaxPlayers, ForcedRegion)
-    MaxPlayers = MaxPlayers or 5
-    SetText("Fetching Server...")
-    local Servers = GetServers()
-    local ArrayServers = {}
-
-    for i, v in next, Servers do
-        if v.Count <= MaxPlayers then
-            table.insert(ArrayServers, {
-                JobId = i,
-                Players = v.Count,
-                LastUpdate = v.__LastUpdate,
-                Region = v.Region
-            })
-        end
+local function normalizeRegion(value)
+    if value == nil then
+        return ""
     end
-    SetText(#ArrayServers, 'servers received')
-    local ServerData
-    for i = 1, #ArrayServers do
-        while task.wait(1) do
-            local Index = math.random(1, #ArrayServers)
-            ServerData = ArrayServers[Index]
-            if ServerData then
-                if not ForcedRegion or ServerData.Regoin == ForcedRegion then
-                    SetText("Found Server:", ServerData.JobId, 'Player Count:', ServerData.Players, "Region:", ServerData.Region)
-                    break
+    return tostring(value):lower()
+end
+
+function GetServers(MaxPlayers, ForcedRegion)
+    local config = getHopConfig(MaxPlayers, ForcedRegion)
+    local serverBrowser = ReplicatedStorage:WaitForChild("__ServerBrowser")
+
+    local startPage = tonumber(HopState.NextPage) or 1
+    if startPage < 1 or startPage > config.MaxPages then
+        startPage = 1
+    end
+
+    local pages = {}
+    for offset = 0, config.PagesPerBatch - 1 do
+        pages[#pages + 1] = ((startPage - 1 + offset) % config.MaxPages) + 1
+    end
+
+    local candidates = {}
+    local seenJobs = {}
+    local cursor = 0
+    local completed = 0
+    local failed = 0
+    local workersDone = 0
+    local active = true
+    local workerCount = math.min(config.Concurrency, #pages)
+    local scanStartedAt = tick()
+
+    HopState.StartPage = pages[1] or startPage
+    HopState.EndPage = pages[#pages] or startPage
+    HopState.CurrentPage = pages[1] or startPage
+    HopState.RequestedPages = #pages
+    HopState.CompletedPages = 0
+    HopState.FailedPages = 0
+    HopState.Candidates = 0
+    HopState.TimedOut = false
+
+    SetText(
+        "Hop | scanning pages "
+        .. tostring(HopState.StartPage)
+        .. "-"
+        .. tostring(HopState.EndPage)
+        .. " | 0/"
+        .. tostring(#pages)
+    )
+
+    local function processPageData(pageData)
+        if type(pageData) ~= "table" then
+            return
+        end
+
+        for jobId, info in pairs(pageData) do
+            local jobKey = tostring(jobId)
+            if type(info) == "table"
+                and jobKey ~= tostring(game.JobId)
+                and not seenJobs[jobKey] then
+
+                local players = tonumber(info.Count)
+                local region = info.Region or info.Regoin
+                local regionOk =
+                    not config.ForcedRegion
+                    or normalizeRegion(region) == normalizeRegion(config.ForcedRegion)
+
+                if players and players <= config.MaxPlayers and regionOk then
+                    seenJobs[jobKey] = true
+                    candidates[#candidates + 1] = {
+                        JobId = jobId,
+                        Players = players,
+                        LastUpdate = tonumber(info.__LastUpdate) or 0,
+                        Region = region or "Unknown",
+                    }
                 end
             end
         end
-
-        print('Teleporting to', ServerData.JobId, '...')
-        ReplicatedStorage:WaitForChild("__ServerBrowser"):InvokeServer('teleport', ServerData.JobId)
     end
+
+    local function worker()
+        while active do
+            cursor = cursor + 1
+            local index = cursor
+            local page = pages[index]
+            if not page then
+                break
+            end
+
+            HopState.CurrentPage = page
+            local ok, pageData = pcall(function()
+                return serverBrowser:InvokeServer(page)
+            end)
+
+            if not active then
+                break
+            end
+
+            if ok and type(pageData) == "table" then
+                processPageData(pageData)
+            else
+                failed = failed + 1
+            end
+
+            completed = completed + 1
+            HopState.CompletedPages = completed
+            HopState.FailedPages = failed
+            HopState.Candidates = #candidates
+
+            if completed == #pages or completed % 5 == 0 then
+                SetText(
+                    "Hop | scanning pages "
+                    .. tostring(HopState.StartPage)
+                    .. "-"
+                    .. tostring(HopState.EndPage)
+                    .. " | "
+                    .. tostring(completed)
+                    .. "/"
+                    .. tostring(#pages)
+                    .. " | candidates "
+                    .. tostring(#candidates)
+                )
+            end
+        end
+
+        workersDone = workersDone + 1
+    end
+
+    for _ = 1, workerCount do
+        task.spawn(worker)
+    end
+
+    repeat
+        task.wait(0.05)
+    until workersDone >= workerCount
+        or (tick() - scanStartedAt) >= config.BatchTimeout
+
+    if workersDone < workerCount then
+        active = false
+        HopState.TimedOut = true
+    end
+
+    local lastRequestedPage = pages[#pages] or startPage
+    HopState.NextPage = ((lastRequestedPage - 1 + 1) % config.MaxPages) + 1
+
+    table.sort(candidates, function(a, b)
+        if a.Players ~= b.Players then
+            return a.Players < b.Players
+        end
+        if a.LastUpdate ~= b.LastUpdate then
+            return a.LastUpdate > b.LastUpdate
+        end
+        return tostring(a.JobId) < tostring(b.JobId)
+    end)
+
+    HopState.Candidates = #candidates
+    return candidates, config
+end
+
+HopServer = function(MaxPlayers, ForcedRegion)
+    if inHopPP then
+        SetText("Hop | teleport already in progress")
+        return false
+    end
+
+    local candidates, config = GetServers(MaxPlayers, ForcedRegion)
+
+    if not candidates or #candidates == 0 then
+        SetText(
+            "Hop | no eligible server"
+            .. " | pages "
+            .. tostring(HopState.StartPage)
+            .. "-"
+            .. tostring(HopState.EndPage)
+            .. " | next "
+            .. tostring(HopState.NextPage)
+            .. " | maxPlayers "
+            .. tostring(config.MaxPlayers)
+        )
+        return false
+    end
+
+    local best = candidates[1]
+
+    SetText(
+        "Hop | best server"
+        .. " | players "
+        .. tostring(best.Players)
+        .. " | region "
+        .. tostring(best.Region)
+        .. " | job "
+        .. tostring(best.JobId)
+    )
+
+    inHopPP = true
+    lastHop = tick()
+
+    local ok = pcall(function()
+        ReplicatedStorage
+            :WaitForChild("__ServerBrowser")
+            :InvokeServer("teleport", best.JobId)
+    end)
+
+    if not ok then
+        inHopPP = false
+        SetText("Hop | teleport call failed")
+        return false
+    end
+
+    task.delay(12, function()
+        inHopPP = false
+    end)
+
+    return true
 end
 
 local connection, tween, pathPart, isTweening = nil, nil, nil, false
@@ -323,8 +562,10 @@ local ChestBypassState = {
     Busy = false,
     SpawnBuilt = false,
     CacheLoaded = false,
+    LastBuild = 0,
     Spawns = {},
     Cache = {
+        Version = 2,
         Spawns = {},
         Locations = {},
     },
@@ -341,7 +582,11 @@ else
     ChestBypassSeaIndex = 1
 end
 
-local ChestBypassCachePath = "chest_bypass_spawns_sea" .. tostring(ChestBypassSeaIndex) .. ".json"
+-- v2 tránh dùng lại cache cũ bị thiếu đảo hoặc ghi đè spawn trùng tên.
+local ChestBypassCachePath =
+    "chest_bypass_spawns_v2_sea"
+    .. tostring(ChestBypassSeaIndex)
+    .. ".json"
 
 local ChestBypassBlockedItems = {
     "Hallow Essence", "Fist of Darkness", "God's Chalice", "Sweet Chalice",
@@ -393,16 +638,35 @@ local function ChestBypassCanUseFiles()
 end
 
 local function ChestBypassRebuild()
-    ChestBypassState.Spawns = {}
-    for name, data in pairs(ChestBypassState.Cache.Spawns or {}) do
-        if type(data) == "table" and data[1] and data[2] and data[3] then
-            ChestBypassState.Spawns[#ChestBypassState.Spawns + 1] = {
-                Name = tostring(name),
-                Position = Vector3.new(data[1], data[2], data[3]),
-            }
+    local rebuilt = {}
+
+    for cacheKey, data in pairs(ChestBypassState.Cache.Spawns or {}) do
+        if type(data) == "table" then
+            local x = tonumber(data.X or data[1])
+            local y = tonumber(data.Y or data[2])
+            local z = tonumber(data.Z or data[3])
+            local spawnName = data.Name or data.SpawnName
+
+            if x and y and z and spawnName then
+                rebuilt[#rebuilt + 1] = {
+                    Key = tostring(cacheKey),
+                    Name = tostring(spawnName),
+                    Group = tostring(data.Group or ""),
+                    Position = Vector3.new(x, y, z),
+                }
+            end
         end
     end
-    ChestBypassState.SpawnBuilt = #ChestBypassState.Spawns > 0
+
+    table.sort(rebuilt, function(a, b)
+        if a.Name ~= b.Name then
+            return a.Name < b.Name
+        end
+        return a.Key < b.Key
+    end)
+
+    ChestBypassState.Spawns = rebuilt
+    ChestBypassState.SpawnBuilt = #rebuilt > 0
     return ChestBypassState.SpawnBuilt
 end
 
@@ -410,17 +674,29 @@ local function ChestBypassLoadCache()
     if ChestBypassState.CacheLoaded then
         return ChestBypassState.SpawnBuilt
     end
+
     ChestBypassState.CacheLoaded = true
+
     if not ChestBypassCanUseFiles() or not isfile(ChestBypassCachePath) then
         return false
     end
+
     local ok, data = pcall(function()
         return HttpService:JSONDecode(readfile(ChestBypassCachePath))
     end)
-    if not ok or type(data) ~= "table" or type(data.Spawns) ~= "table" then
+
+    if not ok
+        or type(data) ~= "table"
+        or tonumber(data.Version) ~= 2
+        or type(data.Spawns) ~= "table" then
         return false
     end
-    data.Locations = type(data.Locations) == "table" and data.Locations or {}
+
+    data.Locations =
+        type(data.Locations) == "table"
+        and data.Locations
+        or {}
+
     ChestBypassState.Cache = data
     return ChestBypassRebuild()
 end
@@ -429,8 +705,14 @@ local function ChestBypassSaveCache()
     if not ChestBypassCanUseFiles() then
         return false
     end
+
+    ChestBypassState.Cache.Version = 2
+
     return pcall(function()
-        writefile(ChestBypassCachePath, HttpService:JSONEncode(ChestBypassState.Cache))
+        writefile(
+            ChestBypassCachePath,
+            HttpService:JSONEncode(ChestBypassState.Cache)
+        )
     end)
 end
 
@@ -442,102 +724,165 @@ local function ChestBypassGetObjectPosition(object)
         if object:IsA("Model") then
             return object:GetPivot().Position
         end
-        return object:GetModelCFrame().Position
+        return nil
     end)
     return ok and position or nil
 end
 
 local function ChestBypassBuildData(force)
-    if ChestBypassState.SpawnBuilt and not force then
+    local now = os.clock()
+
+    if ChestBypassState.SpawnBuilt
+        and not force
+        and now - (ChestBypassState.LastBuild or 0) < 10 then
         return true
     end
-    if not force and ChestBypassLoadCache() then
-        return true
+
+    if not force then
+        ChestBypassLoadCache()
     end
+
     local origin = workspace:FindFirstChild("_WorldOrigin")
     local spawnsFolder = origin and origin:FindFirstChild("PlayerSpawns")
     local locationsFolder = origin and origin:FindFirstChild("Locations")
+
     if not spawnsFolder then
         return ChestBypassState.SpawnBuilt
     end
+
     local changed = false
-    for _, folder in ipairs(spawnsFolder:GetChildren()) do
-        for _, spawnObject in ipairs(folder:GetChildren()) do
-            local position = ChestBypassGetObjectPosition(spawnObject)
-            if position then
-                local old = ChestBypassState.Cache.Spawns[spawnObject.Name]
+    local liveCount = 0
+
+    -- Giữ đúng cấu trúc script đầu: mỗi BasePart/Model con của PlayerSpawns
+    -- là một spawn hợp lệ. Chỉ bổ sung đệ quy Folder để không bỏ sót đảo,
+    -- nhưng không lấy các part con bên trong Model làm tên SetLastSpawnPoint.
+    local function scanSpawnContainer(container, groupPath)
+        for _, object in ipairs(container:GetChildren()) do
+            if object:IsA("BasePart") or object:IsA("Model") then
+                local position = ChestBypassGetObjectPosition(object)
+                if position then
+                    local key = tostring(object:GetFullName())
+                    local old = ChestBypassState.Cache.Spawns[key]
+
+                    liveCount = liveCount + 1
+
+                    if not old
+                        or tostring(old.Name or "") ~= tostring(object.Name)
+                        or math.abs((tonumber(old.X or old[1]) or 0) - position.X) > 1
+                        or math.abs((tonumber(old.Y or old[2]) or 0) - position.Y) > 1
+                        or math.abs((tonumber(old.Z or old[3]) or 0) - position.Z) > 1 then
+
+                        ChestBypassState.Cache.Spawns[key] = {
+                            Name = tostring(object.Name),
+                            Group = tostring(groupPath or ""),
+                            X = position.X,
+                            Y = position.Y,
+                            Z = position.Z,
+                        }
+                        changed = true
+                    end
+                end
+            elseif object:IsA("Folder") then
+                local nextGroup =
+                    tostring(groupPath or "")
+                    .. "/"
+                    .. tostring(object.Name)
+                scanSpawnContainer(object, nextGroup)
+            end
+        end
+    end
+
+    for _, topFolder in ipairs(spawnsFolder:GetChildren()) do
+        if topFolder:IsA("Folder") then
+            scanSpawnContainer(topFolder, topFolder.Name)
+        elseif topFolder:IsA("BasePart") or topFolder:IsA("Model") then
+            scanSpawnContainer(spawnsFolder, "PlayerSpawns")
+            break
+        end
+    end
+
+    if locationsFolder then
+        for _, location in ipairs(locationsFolder:GetChildren()) do
+            if location:IsA("BasePart") then
+                local mesh = location:FindFirstChild("Mesh")
+                local radius = location.Size.X / 2
+
+                if mesh and mesh:IsA("SpecialMesh") then
+                    radius = mesh.Scale.X * location.Size.X / 2
+                end
+
+                local old = ChestBypassState.Cache.Locations[location.Name]
                 if not old
-                    or math.abs((tonumber(old[1]) or 0) - position.X) > 1
-                    or math.abs((tonumber(old[2]) or 0) - position.Y) > 1
-                    or math.abs((tonumber(old[3]) or 0) - position.Z) > 1 then
-                    ChestBypassState.Cache.Spawns[spawnObject.Name] = {
-                        position.X, position.Y, position.Z,
+                    or math.abs((tonumber(old[1]) or 0) - location.Position.X) > 1
+                    or math.abs((tonumber(old[2]) or 0) - location.Position.Y) > 1
+                    or math.abs((tonumber(old[3]) or 0) - location.Position.Z) > 1
+                    or math.abs((tonumber(old[4]) or 0) - radius) > 1 then
+
+                    ChestBypassState.Cache.Locations[location.Name] = {
+                        location.Position.X,
+                        location.Position.Y,
+                        location.Position.Z,
+                        radius,
                     }
                     changed = true
                 end
             end
         end
     end
-    if locationsFolder then
-        for _, location in ipairs(locationsFolder:GetChildren()) do
-            if location:IsA("BasePart") then
-                local mesh = location:FindFirstChild("Mesh")
-                local radius = location.Size.X / 2
-                if mesh and mesh:IsA("SpecialMesh") then
-                    radius = mesh.Scale.X * location.Size.X / 2
-                end
-                ChestBypassState.Cache.Locations[location.Name] = {
-                    location.Position.X, location.Position.Y, location.Position.Z, radius,
-                }
-            end
-        end
-    end
+
+    ChestBypassState.LastBuild = now
     ChestBypassRebuild()
+
     if changed then
         ChestBypassSaveCache()
     end
-    return ChestBypassState.SpawnBuilt
+
+    return ChestBypassState.SpawnBuilt, liveCount
 end
 
--- Xác định đảo theo PlayerSpawn gần nhất. Cách này giúp khóa CFrame trong đúng đảo
--- sau khi TP bypass đổi spawn và nhân vật vừa hồi sinh.
-local function ChestBypassGetNearestSpawn(position)
+local function ChestBypassGetNearestSpawn(position, forceRefresh)
     if typeof(position) ~= "Vector3" then
         return nil, math.huge
     end
-    if not ChestBypassState.SpawnBuilt then
-        ChestBypassBuildData(false)
+
+    if forceRefresh or not ChestBypassState.SpawnBuilt then
+        ChestBypassBuildData(forceRefresh == true)
     end
-    local nearestName = nil
+
+    local nearestData
     local nearestDistance = math.huge
+
     for _, spawnData in ipairs(ChestBypassState.Spawns) do
-        if spawnData and typeof(spawnData.Position) == "Vector3" then
-            local distance = (spawnData.Position - position).Magnitude
-            if distance < nearestDistance then
-                nearestName = tostring(spawnData.Name)
-                nearestDistance = distance
-            end
+        local distance = (spawnData.Position - position).Magnitude
+        if distance < nearestDistance then
+            nearestData = spawnData
+            nearestDistance = distance
         end
     end
-    return nearestName, nearestDistance
+
+    return nearestData, nearestDistance
 end
 
 local function ChestBypassGetCurrentIsland(root)
     if not root or not root.Parent then
         return nil, math.huge
     end
-    return ChestBypassGetNearestSpawn(root.Position)
+
+    local nearest, distance = ChestBypassGetNearestSpawn(root.Position, false)
+    return nearest and nearest.Name or nil, distance
 end
 
 local function ChestBypassIsChestOnIsland(chest, islandName)
-    if getgenv().Settings["Chest Same Island Only"] == false or not islandName then
+    if getgenv().Settings["Chest Same Island Only"] == false then
         return true
     end
-    if not chest or not chest:IsA("BasePart") then
+
+    if not islandName or not chest or not chest:IsA("BasePart") then
         return false
     end
-    local chestIsland = ChestBypassGetNearestSpawn(chest.Position)
-    return chestIsland ~= nil and chestIsland == islandName
+
+    local nearest = ChestBypassGetNearestSpawn(chest.Position, false)
+    return nearest ~= nil and tostring(nearest.Name) == tostring(islandName)
 end
 
 local function ChestBypassSetLastSpawnScript(character, disabled)
@@ -604,6 +949,13 @@ local function ChestBypassStep(target)
     end
     if not ChestBypassBuildData(false) then
         return false
+    end
+
+    -- Nếu cache chưa có spawn hợp lý gần mục tiêu, quét live lại trước khi chọn.
+    local nearestTargetSpawn, nearestTargetDistance =
+        ChestBypassGetNearestSpawn(targetPosition, false)
+    if not nearestTargetSpawn or nearestTargetDistance > 6000 then
+        ChestBypassBuildData(true)
     end
     ChestBypassState.Busy = true
     Tween(false)
@@ -687,35 +1039,66 @@ getgenv().ChestBypassState = ChestBypassState
 
 task.spawn(function()
     ChestBypassLoadCache()
-    for _ = 1, 40 do
-        if ChestBypassBuildData(true) then
+
+    -- Không dừng ngay ở lần đầu có dữ liệu vì PlayerSpawns có thể chưa stream đủ.
+    local lastCount = -1
+    local stablePasses = 0
+
+    for _ = 1, 30 do
+        ChestBypassBuildData(true)
+
+        local count = #ChestBypassState.Spawns
+        if count > 0 and count == lastCount then
+            stablePasses = stablePasses + 1
+        else
+            stablePasses = 0
+            lastCount = count
+        end
+
+        if stablePasses >= 5 then
             break
         end
+
         task.wait(0.5)
     end
 end)
 
 
 local function CFrameJumpChest(chest)
-    if not chest or not chest:IsA("BasePart") or not chest.Parent or not chest.CanTouch then
+    if not chest
+        or not chest:IsA("BasePart")
+        or not chest.Parent
+        or not chest.CanTouch then
         return false
     end
 
-    -- Khóa đảo trước khi CFrame. Chest khác đảo sẽ bị từ chối hoàn toàn.
     local _, _, startRoot = ChestBypassGetCharacter(1)
-    local lockedIsland = startRoot and ChestBypassGetCurrentIsland(startRoot) or nil
+    local lockedIsland =
+        startRoot
+        and ChestBypassGetCurrentIsland(startRoot)
+        or nil
+
     if getgenv().Settings["Chest Same Island Only"] ~= false
-        and (not lockedIsland or not ChestBypassIsChestOnIsland(chest, lockedIsland)) then
+        and (not lockedIsland
+            or not ChestBypassIsChestOnIsland(chest, lockedIsland)) then
         return false
     end
 
-    -- Dừng mọi tween đang chạy trước khi CFrame thẳng vào chest.
     Tween(false)
 
-    local timeout = tonumber(getgenv().Settings["Chest CFrame Timeout"]) or 3
-    local interval = tonumber(getgenv().Settings["Chest CFrame Interval"]) or 0.05
-    local touchRadius = tonumber(getgenv().Settings["Chest Touch Radius"]) or 10
-    local skipDelay = tonumber(getgenv().Settings["Skip Chest Delay"]) or 1
+    local timeout =
+        tonumber(getgenv().Settings["Chest CFrame Timeout"])
+        or 3
+    local interval =
+        tonumber(getgenv().Settings["Chest CFrame Interval"])
+        or 0.05
+    local touchRadius =
+        tonumber(getgenv().Settings["Chest Touch Radius"])
+        or 8
+    local skipDelay =
+        tonumber(getgenv().Settings["Skip Chest Delay"])
+        or 1
+
     timeout = math.clamp(timeout, 1, 10)
     interval = math.clamp(interval, 0.02, 0.25)
     skipDelay = math.clamp(skipDelay, 0.4, timeout)
@@ -728,45 +1111,48 @@ local function CFrameJumpChest(chest)
         if not char or not humanoid or not root or humanoid.Health <= 0 then
             return false
         end
+
         if not chest or not chest.Parent or not chest.CanTouch then
             break
         end
 
+        -- Kiểm tra lại mỗi vòng để tuyệt đối không CFrame sang đảo khác.
+        local currentIsland = ChestBypassGetCurrentIsland(root)
+        if getgenv().Settings["Chest Same Island Only"] ~= false
+            and (not currentIsland
+                or not ChestBypassIsChestOnIsland(chest, currentIsland)) then
+            return false
+        end
+
         humanoid.Sit = false
 
-        -- 1) CFrame/TP thẳng toàn bộ nhân vật đến chest.
-        local moved = pcall(function()
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+
             if char.PrimaryPart then
                 char:SetPrimaryPartCFrame(chest.CFrame)
             else
                 root.CFrame = chest.CFrame
             end
         end)
-        if not moved then
-            pcall(function()
-                char:PivotTo(chest.CFrame)
-            end)
-        end
 
-        -- 2) Ép trạng thái nhảy giống logic Lua chest cũ.
         pcall(function()
             humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-        end)
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-            root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
         end)
 
         task.wait()
 
-        -- 3) Firetouch sau khi đã CFrame và bấm nhảy.
-        if chest and chest.Parent and chest.CanTouch
+        if chest
+            and chest.Parent
+            and chest.CanTouch
             and (root.Position - chest.Position).Magnitude <= touchRadius then
+
             touched = true
             pcall(function()
-                firetouchinterest(chest, root, 0)
+                firetouchinterest(root, chest, 0)
                 task.wait(0.03)
-                firetouchinterest(chest, root, 1)
+                firetouchinterest(root, chest, 1)
             end)
         end
 
@@ -774,9 +1160,12 @@ local function CFrameJumpChest(chest)
             break
         end
 
-        -- Giữ hành vi skip chest cũ để chest ghost không làm vòng farm kẹt mãi.
-        if touched and chest and chest.Parent and chest.CanTouch
+        if touched
+            and chest
+            and chest.Parent
+            and chest.CanTouch
             and os.clock() - startedAt >= skipDelay then
+
             chest.CanTouch = false
             break
         end
@@ -789,14 +1178,19 @@ local function CFrameJumpChest(chest)
         or CheckTool("Fist of Darkness")
         or os.clock() - startedAt >= timeout
 
-    -- Thử chạm lần cuối nếu chest vẫn còn hoạt động.
     local _, humanoid, root = ChestBypassGetCharacter(1)
-    if chest and chest.Parent and chest.CanTouch and humanoid and humanoid.Health > 0 and root then
+    if chest
+        and chest.Parent
+        and chest.CanTouch
+        and humanoid
+        and humanoid.Health > 0
+        and root then
+
         pcall(function()
             humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-            firetouchinterest(chest, root, 0)
+            firetouchinterest(root, chest, 0)
             task.wait(0.05)
-            firetouchinterest(chest, root, 1)
+            firetouchinterest(root, chest, 1)
         end)
         task.wait(0.1)
     end
@@ -868,17 +1262,23 @@ local function GetNearestChest(islandName)
     if not root then
         return nil, math.huge
     end
+
     local nearest
     local nearestDistance = math.huge
     local now = os.clock()
+
     for _, chest in ipairs(CollectionService:GetTagged("_ChestTagged")) do
         if chest
             and chest:IsA("BasePart")
             and chest.Parent
             and chest.CanTouch
             and chest.Name:find("Chest") then
+
             local ignoredUntil = IgnoredChests[chest]
-            local sameIsland = islandName == nil or ChestBypassIsChestOnIsland(chest, islandName)
+            local sameIsland =
+                islandName == nil
+                or ChestBypassIsChestOnIsland(chest, islandName)
+
             if sameIsland and (not ignoredUntil or now >= ignoredUntil) then
                 local distance = (chest.Position - root.Position).Magnitude
                 if distance < nearestDistance then
@@ -888,6 +1288,7 @@ local function GetNearestChest(islandName)
             end
         end
     end
+
     return nearest, nearestDistance
 end
 
@@ -897,105 +1298,137 @@ FarmBeli = (function(shouldStop)
             return false
         end
     end
+
     local sessionCount = 0
+
     if not ChestBypassGetCharacter(5) then
         SetText("Waiting character before chest farm")
         task.wait(1)
         return
     end
+
     Tween(false)
+
     while all < getgenv().Settings["Max Chests"] do
         if shouldStop()
             or CheckTool("Fist of Darkness")
             or CheckMonster("Darkbeard") then
             break
         end
+
         local char, hum, root = ChestBypassGetCharacter(5)
+
         if not char or not hum or not root then
             task.wait(0.5)
         else
-            -- Ưu tiên chest trên đúng đảo hiện tại. Nếu đảo đã hết chest mới lấy
-            -- một chest toàn bản đồ làm đích TP bypass. Sau respawn phải tìm lại
-            -- chest theo đảo mới, không CFrame tới chest mục tiêu cũ.
+            -- Chỉ lấy chest thuộc đảo đang đứng.
             local currentIsland = ChestBypassGetCurrentIsland(root)
             local chest, distance = GetNearestChest(currentIsland)
-            local threshold = tonumber(getgenv().Settings["TP Bypass Distance"]) or 1000
+            local threshold =
+                tonumber(getgenv().Settings["TP Bypass Distance"])
+                or 1000
 
+            -- Đảo hiện tại hết chest: chỉ dùng chest toàn map làm đích đổi spawn.
+            -- Sau khi hồi sinh sẽ tìm lại chest trên đảo mới, không CFrame target cũ.
             if not chest then
                 local bypassTarget, bypassDistance = GetNearestChest(nil)
+
                 if not bypassTarget then
                     break
                 end
-                if getgenv().Settings["TP Bypass"] ~= false and bypassDistance >= threshold then
+
+                if getgenv().Settings["TP Bypass"] ~= false
+                    and bypassDistance >= threshold then
+
                     SetText(
-                        "Collect Chests | TP Bypass to island\nDistance: "
-                        .. math.floor(bypassDistance)
-                        .. " | "
-                        .. all
-                        .. "/"
-                        .. getgenv().Settings["Max Chests"]
+                        "Collect Chests | TP Bypass to island"
+                        .. "\nSpawns detected: "
+                        .. tostring(#ChestBypassState.Spawns)
+                        .. " | Distance: "
+                        .. tostring(math.floor(bypassDistance))
                     )
+
                     ChestBypassTo(bypassTarget.CFrame)
                     char, hum, root = ChestBypassGetCharacter(5)
+
                     if root then
                         currentIsland = ChestBypassGetCurrentIsland(root)
                         chest, distance = GetNearestChest(currentIsland)
                     end
                 end
-            elseif getgenv().Settings["TP Bypass"] ~= false and distance >= threshold then
+            elseif getgenv().Settings["TP Bypass"] ~= false
+                and distance >= threshold then
+
                 SetText(
-                    "Collect Chests | TP Bypass\nIsland: "
+                    "Collect Chests | TP Bypass"
+                    .. "\nIsland: "
                     .. tostring(currentIsland or "Unknown")
+                    .. " | Spawns: "
+                    .. tostring(#ChestBypassState.Spawns)
                     .. " | Distance: "
-                    .. math.floor(distance)
+                    .. tostring(math.floor(distance))
                 )
+
                 ChestBypassTo(chest.CFrame)
                 char, hum, root = ChestBypassGetCharacter(5)
+
                 if root then
                     currentIsland = ChestBypassGetCurrentIsland(root)
                     chest, distance = GetNearestChest(currentIsland)
                 end
             end
 
-            -- Không có chest trên đảo vừa đứng thì bỏ vòng, tuyệt đối không CFrame
-            -- xuyên sang chest thuộc đảo khác.
-            if not chest then
-                task.wait(0.2)
-                break
-            end
             if CheckTool("Fist of Darkness") or CheckMonster("Darkbeard") then
                 break
             end
-            if chest and chest.Parent and chest.CanTouch and char and hum and hum.Health > 0 and root
-                and ChestBypassIsChestOnIsland(chest, ChestBypassGetCurrentIsland(root)) then
+
+            if chest
+                and chest.Parent
+                and chest.CanTouch
+                and char
+                and hum
+                and hum.Health > 0
+                and root
+                and ChestBypassIsChestOnIsland(
+                    chest,
+                    ChestBypassGetCurrentIsland(root)
+                ) then
+
                 local newDistance = (chest.Position - root.Position).Magnitude
+
                 SetText(
-                    "Collect Chests | CFrame + Jump\nIsland: "
+                    "Collect Chests | CFrame + Jump"
+                    .. "\nIsland: "
                     .. tostring(ChestBypassGetCurrentIsland(root) or "Unknown")
                     .. " | "
-                    .. sessionCount
+                    .. tostring(sessionCount)
                     .. "/"
-                    .. all
+                    .. tostring(all)
                     .. "/"
-                    .. getgenv().Settings["Max Chests"]
-                    .. " Chests\nDistance: "
-                    .. math.floor(newDistance)
+                    .. tostring(getgenv().Settings["Max Chests"])
+                    .. " | Distance: "
+                    .. tostring(math.floor(newDistance))
                 )
+
                 local attempted = CFrameJumpChest(chest)
+
                 if attempted and (not chest.Parent or not chest.CanTouch) then
-                    sessionCount += 1
-                    all += 1
+                    sessionCount = sessionCount + 1
+                    all = all + 1
                     IgnoredChests[chest] = nil
                 else
                     IgnoredChests[chest] = os.clock() + 8
                 end
-            else
+            elseif chest then
                 IgnoredChests[chest] = os.clock() + 5
             end
         end
+
         task.wait(0.05)
     end
+
     Tween(false)
+
     if all >= getgenv().Settings["Max Chests"] then
         SetText("Stopped: Max Chests reached")
         HopServer(8)
