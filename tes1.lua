@@ -2,8 +2,9 @@ getgenv().Settings = {
     ["Max Chests"] = 50; -- if you collected 50 chests, hop server
     ["Skip Chest Delay"] = 1; -- (0.4 - 2)
     ["Black Screen"] = false;
-    ["Chest Tween Speed"] = 325; -- tốc độ tween thẳng vào chest, tăng nếu muốn nhanh hơn
-    ["Chest Touch Radius"] = 8; -- khoảng cách bắt đầu firetouch chest
+    ["Chest CFrame Timeout"] = 3; -- tối đa bao nhiêu giây xử lý một chest
+    ["Chest CFrame Interval"] = 0.05; -- nhịp CFrame + Jump + firetouch
+    ["Chest Touch Radius"] = 10; -- bán kính xác nhận trước khi firetouch
     ["TP Bypass"] = true;
     ["TP Bypass Distance"] = 1000;
     ["TP Bypass Max Attempts"] = 3;
@@ -653,116 +654,103 @@ task.spawn(function()
 end)
 
 
-local function TweenChest(chest)
+local function CFrameJumpChest(chest)
     if not chest or not chest:IsA("BasePart") or not chest.Parent or not chest.CanTouch then
         return false
     end
-    if not Character or IsDied(Character) or not HumanoidRootPart then
-        return false
-    end
 
+    -- Dừng mọi tween đang chạy trước khi CFrame thẳng vào chest.
     Tween(false)
 
-    local char = LocalPlayer.Character
-    local root = char and char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char and char:FindFirstChildWhichIsA("Humanoid")
-    if not root or not humanoid or humanoid.Health <= 0 then
-        return false
-    end
+    local timeout = tonumber(getgenv().Settings["Chest CFrame Timeout"]) or 3
+    local interval = tonumber(getgenv().Settings["Chest CFrame Interval"]) or 0.05
+    local touchRadius = tonumber(getgenv().Settings["Chest Touch Radius"]) or 10
+    local skipDelay = tonumber(getgenv().Settings["Skip Chest Delay"]) or 1
+    timeout = math.clamp(timeout, 1, 10)
+    interval = math.clamp(interval, 0.02, 0.25)
+    skipDelay = math.clamp(skipDelay, 0.4, timeout)
 
-    humanoid.Sit = false
-    pcall(function()
-        root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
-        root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
-    end)
-
-    local speed = tonumber(getgenv().Settings["Chest Tween Speed"]) or 325
-    local touchRadius = tonumber(getgenv().Settings["Chest Touch Radius"]) or 8
-    local targetCFrame = chest.CFrame
-    local distance = (root.Position - targetCFrame.Position).Magnitude
-    local duration = math.max(distance / speed, 0.08)
-    local timeout = math.clamp(duration + 2.5, 2.5, 12)
-
-    local ghost = Instance.new("Part")
-    ghost.Name = "ChestTweenGhost"
-    ghost.Transparency = 1
-    ghost.Anchored = true
-    ghost.CanCollide = false
-    ghost.Size = Vector3.new(2, 2, 2)
-    ghost.CFrame = root.CFrame
-    ghost.Parent = workspace
-
+    local startedAt = os.clock()
     local touched = false
-    local done = false
-    local conn
-    local tw = TweenService:Create(ghost, TweenInfo.new(duration, Enum.EasingStyle.Linear), {
-        CFrame = targetCFrame
-    })
 
-    conn = RunService.Heartbeat:Connect(function()
-        if not root or not root.Parent or not ghost or not ghost.Parent then
-            return
+    repeat
+        local char, humanoid, root = ChestBypassGetCharacter(1)
+        if not char or not humanoid or not root or humanoid.Health <= 0 then
+            return false
         end
-        if IsDied(Character) then
-            return
+        if not chest or not chest.Parent or not chest.CanTouch then
+            break
         end
 
-        root.CFrame = ghost.CFrame
+        humanoid.Sit = false
+
+        -- 1) CFrame/TP thẳng toàn bộ nhân vật đến chest.
+        local moved = pcall(function()
+            if char.PrimaryPart then
+                char:SetPrimaryPartCFrame(chest.CFrame)
+            else
+                root.CFrame = chest.CFrame
+            end
+        end)
+        if not moved then
+            pcall(function()
+                char:PivotTo(chest.CFrame)
+            end)
+        end
+
+        -- 2) Ép trạng thái nhảy giống logic Lua chest cũ.
+        pcall(function()
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
+        end)
         pcall(function()
             root.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
             root.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
         end)
 
-        if chest and chest.Parent and chest.CanTouch and (root.Position - chest.Position).Magnitude <= touchRadius then
-            if not touched then
-                touched = true
-                pcall(function()
-                    firetouchinterest(chest, root, 0)
-                    task.wait(0.05)
-                    firetouchinterest(chest, root, 1)
-                end)
-            end
-        end
-    end)
+        task.wait()
 
-    tw.Completed:Connect(function()
-        done = true
-    end)
-    tw:Play()
-
-    local start = tick()
-    task.delay(getgenv().Settings["Skip Chest Delay"], function()
-        if chest and chest.Parent and chest.CanTouch and touched then
-            chest.CanTouch = false
-        end
-    end)
-
-    repeat
-        if chest and chest.Parent and chest.CanTouch and (root.Position - chest.Position).Magnitude <= touchRadius then
+        -- 3) Firetouch sau khi đã CFrame và bấm nhảy.
+        if chest and chest.Parent and chest.CanTouch
+            and (root.Position - chest.Position).Magnitude <= touchRadius then
+            touched = true
             pcall(function()
                 firetouchinterest(chest, root, 0)
                 task.wait(0.03)
                 firetouchinterest(chest, root, 1)
             end)
         end
-        task.wait()
-    until not chest or not chest.Parent or not chest.CanTouch or IsDied(Character) or CheckTool("Fist of Darkness") or tick() - start >= timeout
 
-    pcall(function() tw:Cancel() end)
-    if conn then conn:Disconnect() end
-    if ghost then ghost:Destroy() end
+        if CheckTool("Fist of Darkness") then
+            break
+        end
 
-    if chest and chest.Parent and chest.CanTouch and not IsDied(Character) then
+        -- Giữ hành vi skip chest cũ để chest ghost không làm vòng farm kẹt mãi.
+        if touched and chest and chest.Parent and chest.CanTouch
+            and os.clock() - startedAt >= skipDelay then
+            chest.CanTouch = false
+            break
+        end
+
+        task.wait(interval)
+    until not chest
+        or not chest.Parent
+        or not chest.CanTouch
+        or IsDied(LocalPlayer.Character)
+        or CheckTool("Fist of Darkness")
+        or os.clock() - startedAt >= timeout
+
+    -- Thử chạm lần cuối nếu chest vẫn còn hoạt động.
+    local _, humanoid, root = ChestBypassGetCharacter(1)
+    if chest and chest.Parent and chest.CanTouch and humanoid and humanoid.Health > 0 and root then
         pcall(function()
+            humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
             firetouchinterest(chest, root, 0)
             task.wait(0.05)
             firetouchinterest(chest, root, 1)
         end)
-        task.wait(0.15)
+        task.wait(0.1)
     end
 
-    -- Nếu chest bị ghost / không đổi CanTouch sau khi đã tween tới nơi,
-    -- đánh dấu false để không bị kẹt lặp mãi ở cùng 1 chest.
     if chest and chest.Parent and chest.CanTouch and touched then
         chest.CanTouch = false
     end
@@ -898,7 +886,7 @@ FarmBeli = (function(shouldStop)
             if chest and chest.Parent and chest.CanTouch and char and hum and hum.Health > 0 and root then
                 local newDistance = (chest.Position - root.Position).Magnitude
                 SetText(
-                    "Collect Chests | Tweening: "
+                    "Collect Chests | CFrame + Jump: "
                     .. sessionCount
                     .. "/"
                     .. all
@@ -907,7 +895,7 @@ FarmBeli = (function(shouldStop)
                     .. " Chests\nDistance: "
                     .. math.floor(newDistance)
                 )
-                local attempted = TweenChest(chest)
+                local attempted = CFrameJumpChest(chest)
                 if attempted and (not chest.Parent or not chest.CanTouch) then
                     sessionCount += 1
                     all += 1
