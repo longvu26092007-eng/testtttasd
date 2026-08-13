@@ -1,5 +1,5 @@
 --[[
-    KATAKURI COORDINATOR CLIENT
+    KATAKURI COORDINATOR CLIENT V3
     Standalone Cake Prince farm + 20-tab shared server coordination.
 
     Design goals:
@@ -38,28 +38,40 @@ local Config = {
     BrowserMaxPages = math.clamp(tonumber(UserConfig.BrowserMaxPages) or 100, 1, 100),
     PreferredPlayersMin = tonumber(UserConfig.PreferredPlayersMin) or 5,
     PreferredPlayersMax = tonumber(UserConfig.PreferredPlayersMax) or 6,
-    BrowserPageDelay = tonumber(UserConfig.BrowserPageDelay) or 0.025,
-    BrowserCacheSeconds = tonumber(UserConfig.BrowserCacheSeconds) or 7,
+    -- Browser is scanned in parallel batches. 100 is still the hard maximum,
+    -- but a client leaves as soon as it has enough usable 5-6 player candidates.
+    BrowserPageDelay = tonumber(UserConfig.BrowserPageDelay) or 0,
+    BrowserBatchSize = math.clamp(tonumber(UserConfig.BrowserBatchSize) or 8, 1, 20),
+    BrowserBatchTimeout = tonumber(UserConfig.BrowserBatchTimeout) or 1.10,
+    BrowserTargetCandidates = math.clamp(tonumber(UserConfig.BrowserTargetCandidates) or 4, 1, 20),
+    BrowserCacheSeconds = tonumber(UserConfig.BrowserCacheSeconds) or 2,
     CandidateLocalBlacklistSeconds = tonumber(UserConfig.CandidateLocalBlacklistSeconds) or 150,
-    TeleportWaitSeconds = tonumber(UserConfig.TeleportWaitSeconds) or 8,
+    TeleportWaitSeconds = tonumber(UserConfig.TeleportWaitSeconds) or 6,
 
     -- Local coordinator.
     EnableWebSocket = UserConfig.EnableWebSocket ~= false,
     WSUrl = tostring(UserConfig.WSUrl or "ws://127.0.0.1:9877"),
-    RoomRequestInterval = tonumber(UserConfig.RoomRequestInterval) or 1.0,
-    RoomHeartbeatInterval = tonumber(UserConfig.RoomHeartbeatInterval) or 1.25,
-    ClientHeartbeatInterval = tonumber(UserConfig.ClientHeartbeatInterval) or 8,
-    SharedRoomWaitBeforeBrowser = tonumber(UserConfig.SharedRoomWaitBeforeBrowser) or 0.65,
-    ClaimReplyTimeout = tonumber(UserConfig.ClaimReplyTimeout) or 1.0,
+    RoomRequestInterval = tonumber(UserConfig.RoomRequestInterval) or 0.25,
+    RoomHeartbeatInterval = tonumber(UserConfig.RoomHeartbeatInterval) or 0.75,
+    ClientHeartbeatInterval = tonumber(UserConfig.ClientHeartbeatInterval) or 2,
+    WSAckTimeout = tonumber(UserConfig.WSAckTimeout) or 3.0,
+    WSStaleSeconds = tonumber(UserConfig.WSStaleSeconds) or 25,
+    SharedRoomWaitBeforeBrowser = tonumber(UserConfig.SharedRoomWaitBeforeBrowser) or 0.15,
+    ClaimReplyTimeout = tonumber(UserConfig.ClaimReplyTimeout) or 0.35,
 
     -- Farm/combat.
-    TweenSpeed = tonumber(UserConfig.TweenSpeed) or 300,
+    TweenSpeed = tonumber(UserConfig.TweenSpeed) or 340,
     MobHoverHeight = tonumber(UserConfig.MobHoverHeight) or 20,
     BossHoverHeight = tonumber(UserConfig.BossHoverHeight) or 25,
     BringRadius = tonumber(UserConfig.BringRadius) or 350,
-    AttackRadius = tonumber(UserConfig.AttackRadius) or 70,
-    SpawnerCooldown = tonumber(UserConfig.SpawnerCooldown) or 1.5,
-    MirrorTouchCooldown = tonumber(UserConfig.MirrorTouchCooldown) or 1.5,
+    AttackRadius = tonumber(UserConfig.AttackRadius) or 75,
+    AttackInterval = math.max(0.02, tonumber(UserConfig.AttackInterval) or 0.035),
+    HoverFollowSharpness = tonumber(UserConfig.HoverFollowSharpness) or 24,
+    HoverSnapDistance = tonumber(UserConfig.HoverSnapDistance) or 6,
+    BusoCheckInterval = tonumber(UserConfig.BusoCheckInterval) or 0.75,
+    BusoRetryCooldown = tonumber(UserConfig.BusoRetryCooldown) or 1.25,
+    SpawnerCooldown = tonumber(UserConfig.SpawnerCooldown) or 1.0,
+    MirrorTouchCooldown = tonumber(UserConfig.MirrorTouchCooldown) or 1.0,
 
     -- UI/debug.
     UIUpdateInterval = tonumber(UserConfig.UIUpdateInterval) or 0.45,
@@ -134,6 +146,9 @@ local State = {
 
     WS = nil,
     WSConnected = false,
+    WSReady = false,
+    WSConnectedAt = 0,
+    LastWSRxAt = 0,
     CoordinatorClients = 0,
     CoordinatorRooms = 0,
     LastRoomRequestAt = 0,
@@ -369,7 +384,12 @@ task.spawn(function()
             labels.State.Text = "State: " .. State.Phase
             labels.Server.Text = string.format("Server: %d/%d | %s", #Players:GetPlayers(), Players.MaxPlayers, string.sub(game.JobId, 1, 10))
             labels.Progress.Text = string.format("Progress: remaining=%s | killed=%s/%d", remainingText, killedText, Config.TotalRequired)
-            labels.Coordinator.Text = string.format("WS: %s | clients=%d | rooms=%d", State.WSConnected and "ON" or "OFF", State.CoordinatorClients, State.CoordinatorRooms)
+            labels.Coordinator.Text = string.format(
+                "WS: %s | clients=%d | rooms=%d",
+                State.WSReady and "READY" or (State.WSConnected and "CONNECTING" or "OFF"),
+                State.CoordinatorClients,
+                State.CoordinatorRooms
+            )
             labels.Room.Text = "Room: " .. (State.InQualifiedRoom and "QUALIFIED / SHARING" or "SCOUT")
             labels.Status.Text = "Status: " .. State.Status .. (State.Extra ~= "" and ("\n" .. State.Extra) or "")
         end)
@@ -378,13 +398,19 @@ task.spawn(function()
 end)
 
 -- ============================================================================
--- [05] MOVEMENT CONTROLLER - one Heartbeat / one proxy
+-- [05] MOVEMENT CONTROLLER - one Heartbeat / stable hover
 -- ============================================================================
+-- MOVE/HOLD are used for static navigation points.
+-- FOLLOW is used for mobs/bosses and remains active even after arriving, so
+-- gravity can never pull the character down between state-machine ticks.
 local Movement = {
     Proxy = nil,
     Tween = nil,
-    Active = false,
+    Mode = "IDLE", -- IDLE | MOVE | HOLD | FOLLOW
     Target = nil,
+    FollowPart = nil,
+    FollowOffset = CFrame.new(),
+    Speed = Config.TweenSpeed,
     LastRetargetAt = 0,
 }
 
@@ -403,13 +429,41 @@ local function ensureProxy()
     return p
 end
 
-function Movement.cancel()
-    Movement.Active = false
-    Movement.Target = nil
+local function cancelTweenOnly()
     if Movement.Tween then
         pcall(function() Movement.Tween:Cancel() end)
         Movement.Tween = nil
     end
+end
+
+function Movement.cancel()
+    Movement.Mode = "IDLE"
+    Movement.Target = nil
+    Movement.FollowPart = nil
+    cancelTweenOnly()
+end
+
+function Movement.holdAt(targetCFrame)
+    if typeof(targetCFrame) ~= "CFrame" then return false end
+    cancelTweenOnly()
+    Movement.Mode = "HOLD"
+    Movement.Target = targetCFrame
+    Movement.FollowPart = nil
+    return true
+end
+
+function Movement.followPart(part, offsetCFrame, speed)
+    if not part or not part:IsA("BasePart") or not part.Parent then
+        Movement.cancel()
+        return false
+    end
+    cancelTweenOnly()
+    Movement.Mode = "FOLLOW"
+    Movement.FollowPart = part
+    Movement.FollowOffset = typeof(offsetCFrame) == "CFrame" and offsetCFrame or CFrame.new()
+    Movement.Speed = tonumber(speed) or Config.TweenSpeed
+    Movement.Target = nil
+    return true
 end
 
 function Movement.moveTo(targetCFrame, speed)
@@ -419,52 +473,106 @@ function Movement.moveTo(targetCFrame, speed)
 
     hum.Sit = false
     local dist = (root.Position - targetCFrame.Position).Magnitude
-    if dist <= 6 then
-        Movement.cancel()
-        pcall(function()
-            root.AssemblyLinearVelocity = Vector3.zero
-            root.AssemblyAngularVelocity = Vector3.zero
-            root.CFrame = targetCFrame
-        end)
+    if dist <= Config.HoverSnapDistance then
+        Movement.holdAt(targetCFrame)
         return true
     end
 
     local now = os.clock()
-    if Movement.Active and Movement.Target then
+    if Movement.Mode == "MOVE" and Movement.Target then
         local targetDelta = (Movement.Target.Position - targetCFrame.Position).Magnitude
-        if targetDelta < 12 and now - Movement.LastRetargetAt < 0.35 then
+        if targetDelta < 10 and now - Movement.LastRetargetAt < 0.20 then
             return false
         end
     end
 
     local proxy = ensureProxy()
-    if Movement.Tween then pcall(function() Movement.Tween:Cancel() end) end
+    cancelTweenOnly()
     proxy.CFrame = root.CFrame
     Movement.Target = targetCFrame
-    Movement.Active = true
+    Movement.FollowPart = nil
+    Movement.Mode = "MOVE"
+    Movement.Speed = tonumber(speed) or Config.TweenSpeed
     Movement.LastRetargetAt = now
 
-    local travel = math.max(dist / (tonumber(speed) or Config.TweenSpeed), 0.05)
-    Movement.Tween = TweenService:Create(proxy, TweenInfo.new(travel, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
+    local travel = math.max(dist / Movement.Speed, 0.03)
+    Movement.Tween = TweenService:Create(
+        proxy,
+        TweenInfo.new(travel, Enum.EasingStyle.Linear),
+        {CFrame = targetCFrame}
+    )
     Movement.Tween:Play()
     return false
 end
 
-RunService.Heartbeat:Connect(function()
-    if not State.Running or not Movement.Active then return end
+local function stableRootSet(root, hum, targetCFrame)
+    hum.Sit = false
+    root.AssemblyLinearVelocity = Vector3.zero
+    root.AssemblyAngularVelocity = Vector3.zero
+    root.CFrame = targetCFrame
+end
+
+RunService.Heartbeat:Connect(function(dt)
+    if not State.Running or Movement.Mode == "IDLE" then return end
+
     local root = State.Root
     local hum = State.Humanoid
-    local proxy = Movement.Proxy
-    if not root or not hum or hum.Health <= 0 or not proxy or not proxy.Parent then
+    if not root or not hum or hum.Health <= 0 then
         Movement.cancel()
         return
     end
-    pcall(function()
-        hum.Sit = false
-        root.AssemblyLinearVelocity = Vector3.zero
-        root.AssemblyAngularVelocity = Vector3.zero
-        root.CFrame = proxy.CFrame
-    end)
+
+    if Movement.Mode == "MOVE" then
+        local proxy = Movement.Proxy
+        if not proxy or not proxy.Parent then
+            Movement.cancel()
+            return
+        end
+        pcall(stableRootSet, root, hum, proxy.CFrame)
+        return
+    end
+
+    if Movement.Mode == "HOLD" then
+        if typeof(Movement.Target) ~= "CFrame" then
+            Movement.cancel()
+            return
+        end
+        pcall(stableRootSet, root, hum, Movement.Target)
+        return
+    end
+
+    if Movement.Mode == "FOLLOW" then
+        local part = Movement.FollowPart
+        if not part or not part.Parent then
+            Movement.cancel()
+            return
+        end
+
+        local desired = part.CFrame * Movement.FollowOffset
+        local dist = (root.Position - desired.Position).Magnitude
+        local targetCFrame
+
+        if dist > 30 then
+            -- Capped linear catch-up avoids a hard snap from far away.
+            local maxStep = math.max(1, Movement.Speed * math.max(dt, 1 / 240))
+            local alpha = math.clamp(maxStep / math.max(dist, 0.001), 0, 1)
+            targetCFrame = root.CFrame:Lerp(desired, alpha)
+        else
+            -- High-frequency damped follow. It continuously holds Y, eliminating
+            -- the old "arrive -> cancel tween -> gravity drop -> retween" jitter.
+            local alpha = math.clamp(
+                1 - math.exp(-Config.HoverFollowSharpness * math.max(dt, 1 / 240)),
+                0,
+                1
+            )
+            if dist <= Config.HoverSnapDistance then
+                alpha = math.max(alpha, 0.82)
+            end
+            targetCFrame = root.CFrame:Lerp(desired, alpha)
+        end
+
+        pcall(stableRootSet, root, hum, targetCFrame)
+    end
 end)
 
 -- ============================================================================
@@ -517,6 +625,12 @@ local function queryProgress(force)
     end
 
     State.LastProgressAt = now
+
+    -- Strong visual/model evidence wins even if the remote is temporarily noisy.
+    local bossActive = activeCakePrince()
+    local bossStored = storedCakePrince()
+    local mirrorReady = mirrorOpen()
+
     local ok, raw = pcall(function()
         return COMMF_:InvokeServer("CakePrinceSpawner")
     end)
@@ -527,28 +641,42 @@ local function queryProgress(force)
         remaining = nil,
         killed = nil,
         raw = raw,
+        evidence = nil,
     }
 
-    if ok then
+    if bossActive or bossStored then
+        result.known = true
+        result.ready = true
+        result.remaining = 0
+        result.killed = Config.TotalRequired
+        result.evidence = bossActive and "boss_active" or "boss_stored"
+    elseif mirrorReady then
+        -- Several source variants use an open BigMirror as the "Cake Prince can
+        -- spawn / is spawning" state. Treat that server as qualified immediately.
+        result.known = true
+        result.ready = true
+        result.remaining = 0
+        result.killed = Config.TotalRequired
+        result.evidence = "mirror_ready"
+    elseif ok then
         local rawString = raw ~= nil and tostring(raw) or nil
         local number = rawString and tonumber(string.match(rawString, "%d+")) or nil
+
         if number then
             number = math.clamp(number, 0, Config.TotalRequired)
             result.known = true
             result.remaining = number
             result.killed = Config.TotalRequired - number
             result.ready = number <= 0
+            result.evidence = result.ready and "remote_zero" or "remote_remaining"
         elseif rawString and rawString ~= "" then
-            -- Source variants use the no-number response as spawn-ready.
+            -- Existing Katakuri sources interpret CakePrinceSpawner responses
+            -- with no numeric "remaining" value as spawn-ready.
             result.known = true
             result.ready = true
             result.remaining = 0
             result.killed = Config.TotalRequired
-        elseif activeCakePrince() or storedCakePrince() or mirrorOpen() then
-            result.known = true
-            result.ready = true
-            result.remaining = 0
-            result.killed = Config.TotalRequired
+            result.evidence = "remote_spawn_ready"
         end
     end
 
@@ -584,13 +712,28 @@ local Attack = {
     RemoteAttack = nil,
     RemoteAttackId = nil,
     Seed = nil,
+    RegisterAttack = nil,
+    RegisterHit = nil,
     LastAttackAt = 0,
     LastKenAt = 0,
+    LastBusoAt = 0,
 }
 
-pcall(function()
-    Attack.Seed = ReplicatedStorage.Modules.Net.seed:InvokeServer()
-end)
+local function refreshAttackNet()
+    pcall(function()
+        local modules = ReplicatedStorage:FindFirstChild("Modules")
+        local net = modules and modules:FindFirstChild("Net")
+        if not net then return end
+        Attack.RegisterAttack = net:FindFirstChild("RE/RegisterAttack")
+        Attack.RegisterHit = net:FindFirstChild("RE/RegisterHit")
+        local seedRemote = net:FindFirstChild("seed")
+        if seedRemote and not Attack.Seed then
+            Attack.Seed = seedRemote:InvokeServer()
+        end
+    end)
+end
+
+refreshAttackNet()
 
 task.spawn(function()
     local containers = {
@@ -643,7 +786,7 @@ local function aliveModel(model)
 end
 
 local function fastAttackModels(models)
-    if os.clock() - Attack.LastAttackAt < 0.02 then return end
+    if os.clock() - Attack.LastAttackAt < Config.AttackInterval then return end
     if not State.Root or not State.Humanoid or State.Humanoid.Health <= 0 then return end
     if not State.Character or not State.Character:FindFirstChildOfClass("Tool") then return end
 
@@ -669,12 +812,11 @@ local function fastAttackModels(models)
     if not payload[1] then return end
 
     pcall(function()
-        local net = ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("Net")
-        if not net then return end
-        local registerAttack = net:FindFirstChild("RE/RegisterAttack")
-        local registerHit = net:FindFirstChild("RE/RegisterHit")
-        if registerAttack then registerAttack:FireServer() end
-        if registerHit then registerHit:FireServer(unpack(payload)) end
+        if not Attack.RegisterAttack or not Attack.RegisterHit then
+            refreshAttackNet()
+        end
+        if Attack.RegisterAttack then Attack.RegisterAttack:FireServer() end
+        if Attack.RegisterHit then Attack.RegisterHit:FireServer(unpack(payload)) end
     end)
 
     pcall(function()
@@ -715,32 +857,57 @@ local function nearestCakeMob()
     return best, bestDist
 end
 
-local function bringCakeMobs(anchorCFrame)
-    if typeof(anchorCFrame) ~= "CFrame" then return end
+local function bringCakeMobs(anchorMob)
+    if not aliveModel(anchorMob) then return end
+
+    local anchorRoot = anchorMob:FindFirstChild("HumanoidRootPart")
+    local anchorHum = anchorMob:FindFirstChildOfClass("Humanoid")
+    if not anchorRoot or not anchorHum then return end
+    local anchorCFrame = anchorRoot.CFrame
+
     pcall(function() setscriptable(Player, "SimulationRadius", true) end)
     pcall(function() sethiddenproperty(Player, "SimulationRadius", math.huge) end)
 
+    -- Keep the selected anchor mob exactly where it already is. The previous
+    -- implementation could offset the anchor itself every tick, causing the
+    -- whole pack (and the player following it) to drift/jitter.
+    pcall(function()
+        anchorRoot.AssemblyLinearVelocity = Vector3.zero
+        anchorRoot.AssemblyAngularVelocity = Vector3.zero
+        anchorRoot.CanCollide = false
+        anchorRoot.Size = Vector3.new(55, 55, 55)
+        anchorHum.WalkSpeed = 0
+        anchorHum.JumpPower = 0
+    end)
+
     local index = 0
     for _, mob in ipairs(cakeMobList()) do
-        local root = mob:FindFirstChild("HumanoidRootPart")
-        local hum = mob:FindFirstChildOfClass("Humanoid")
-        if root and hum and (root.Position - anchorCFrame.Position).Magnitude <= Config.BringRadius then
-            local owns = true
-            if type(isnetworkowner) == "function" then
-                local ok, result = pcall(isnetworkowner, root)
-                owns = ok and result or false
-            end
-            if owns then
-                index += 1
-                pcall(function()
-                    root.AssemblyLinearVelocity = Vector3.zero
-                    root.AssemblyAngularVelocity = Vector3.zero
-                    root.CanCollide = false
-                    root.Size = Vector3.new(55, 55, 55)
-                    hum.WalkSpeed = 0
-                    hum.JumpPower = 0
-                    root.CFrame = anchorCFrame * CFrame.new((index - 1) * 1.5, 0, 0)
-                end)
+        if mob ~= anchorMob then
+            local root = mob:FindFirstChild("HumanoidRootPart")
+            local hum = mob:FindFirstChildOfClass("Humanoid")
+            if root and hum and (root.Position - anchorCFrame.Position).Magnitude <= Config.BringRadius then
+                local owns = true
+                if type(isnetworkowner) == "function" then
+                    local ok, result = pcall(isnetworkowner, root)
+                    owns = ok and result or false
+                end
+
+                if owns then
+                    index += 1
+                    local column = ((index - 1) % 3) - 1
+                    local row = math.floor((index - 1) / 3) + 1
+                    local offset = CFrame.new(column * 2.2, 0, row * 2.2)
+
+                    pcall(function()
+                        root.AssemblyLinearVelocity = Vector3.zero
+                        root.AssemblyAngularVelocity = Vector3.zero
+                        root.CanCollide = false
+                        root.Size = Vector3.new(55, 55, 55)
+                        hum.WalkSpeed = 0
+                        hum.JumpPower = 0
+                        root.CFrame = anchorCFrame * offset
+                    end)
+                end
             end
         end
     end
@@ -760,11 +927,13 @@ local function farmCakeMobStep(progress)
         return
     end
 
-    local anchor = mob.HumanoidRootPart.CFrame
-    bringCakeMobs(anchor)
+    bringCakeMobs(mob)
     equipMelee()
-    Movement.moveTo(anchor * CFrame.new(0, Config.MobHoverHeight, 0))
-    fastAttackModels(cakeMobList())
+    Movement.followPart(
+        mob.HumanoidRootPart,
+        CFrame.new(0, Config.MobHoverHeight, 0),
+        Config.TweenSpeed
+    )
 
     if os.clock() - Attack.LastKenAt >= 10 then
         Attack.LastKenAt = os.clock()
@@ -833,11 +1002,59 @@ local function killCakePrinceStep()
     equipMelee()
     local root = boss:FindFirstChild("HumanoidRootPart")
     if root then
-        Movement.moveTo(root.CFrame * CFrame.new(0, Config.BossHoverHeight, 0))
-        fastAttackModels({boss})
+        Movement.followPart(
+            root,
+            CFrame.new(0, Config.BossHoverHeight, 0),
+            Config.TweenSpeed
+        )
     end
     setStatus("Killing Cake Prince", "KILL_BOSS", boss:FindFirstChildOfClass("Humanoid") and ("HP=" .. math.floor(boss.Humanoid.Health)) or "")
 end
+
+
+-- One dedicated fast-attack loop. Attack cadence no longer depends on the
+-- slower progress/state-machine loop, and only one loop owns hit remotes.
+task.spawn(function()
+    while State.Running do
+        local phase = State.Phase
+        if phase == "FARM_MOBS" then
+            equipMelee()
+            fastAttackModels(cakeMobList())
+        elseif phase == "KILL_BOSS" then
+            local boss = activeCakePrince()
+            if boss then
+                equipMelee()
+                fastAttackModels({boss})
+            end
+        end
+        task.wait(Config.AttackInterval)
+    end
+end)
+
+-- Auto Buso is always enforced, including after respawn/teleport.
+-- Reference behavior from the Ghoul/Cyborg source: invoke "Buso" whenever
+-- HasBuso is missing. A short cooldown prevents remote spam on 20 tabs.
+local function ensureBuso()
+    local character = State.Character
+    local hum = State.Humanoid
+    if not character or not hum or hum.Health <= 0 then return false end
+    if character:FindFirstChild("HasBuso") then return true end
+
+    local now = os.clock()
+    if now - Attack.LastBusoAt < Config.BusoRetryCooldown then return false end
+    Attack.LastBusoAt = now
+    pcall(function()
+        COMMF_:InvokeServer("Buso")
+    end)
+    return character:FindFirstChild("HasBuso") ~= nil
+end
+
+task.spawn(function()
+    while State.Running do
+        ensureBuso()
+        task.wait(Config.BusoCheckInterval)
+    end
+end)
 
 -- ============================================================================
 -- [08] VISITED SERVER CACHE (per account, persists across teleports)
@@ -917,6 +1134,7 @@ local function wsSend(payload)
     end)
     if not ok then
         State.WSConnected = false
+        State.WSReady = false
     end
     return ok
 end
@@ -929,7 +1147,7 @@ end
 local function clientMeta(messageType)
     return {
         type = messageType,
-        version = 1,
+        version = 3,
         player = Player.Name,
         userId = Player.UserId,
         placeId = game.PlaceId,
@@ -937,6 +1155,7 @@ local function clientMeta(messageType)
         playerCount = #Players:GetPlayers(),
         maxPlayers = Players.MaxPlayers,
         state = State.Phase,
+        qualified = State.InQualifiedRoom,
     }
 end
 
@@ -969,6 +1188,7 @@ local function publishRoom(progress)
         killed = Config.TotalRequired - (tonumber(remaining) or 0),
         bossState = bossState,
         qualifiedRemaining = Config.QualifiedRemaining,
+        qualified = true,
         sentAt = os.time(),
     })
 end
@@ -1071,6 +1291,11 @@ local function handleWebSocketMessage(message)
     local ok, data = pcall(function() return HttpService:JSONDecode(message) end)
     if not ok or type(data) ~= "table" then return end
 
+    State.LastWSRxAt = os.clock()
+    if data.type == "welcome" or data.type == "hello_ack" or data.type == "coordinator_stats" then
+        State.WSReady = true
+    end
+
     if data.type == "ping" then
         wsSend({type = "pong", time = os.time(), player = Player.Name, userId = Player.UserId, jobId = game.JobId})
         return
@@ -1083,14 +1308,22 @@ local function handleWebSocketMessage(message)
     end
 
     if data.type == "hello_ack" then
+        State.WSReady = true
+        State.LastWSRxAt = os.clock()
         State.CoordinatorClients = tonumber(data.clients) or State.CoordinatorClients
         State.CoordinatorRooms = tonumber(data.rooms) or State.CoordinatorRooms
+        -- Immediately ask for a room after handshake; don't wait for scoutStep.
+        if not State.InQualifiedRoom then
+            requestSharedRoom(true)
+        end
         return
     end
 
     if data.type == "room_hint" then
         if not State.InQualifiedRoom and tostring(data.jobId or "") ~= game.JobId then
             State.RoomHint = true
+            -- A shared good room always beats continuing browser work.
+            requestSharedRoom(true)
         end
         return
     end
@@ -1119,15 +1352,17 @@ end
 local function bindSocketEvent(socket, eventName, callback)
     local ok, signal = pcall(function() return socket[eventName] end)
     if not ok or signal == nil then return false end
-    if typeof(signal) == "RBXScriptSignal" then
-        signal:Connect(callback)
-        return true
-    end
-    if type(signal) == "table" and type(signal.Connect) == "function" then
-        signal:Connect(callback)
-        return true
-    end
-    return false
+
+    -- Executors expose WebSocket events as RBXScriptSignal, userdata proxies,
+    -- or custom signal tables. Do not restrict by typeof/type.
+    local connected = pcall(function()
+        local connect = signal.Connect or signal.connect
+        if type(connect) ~= "function" then
+            error("event has no Connect/connect")
+        end
+        connect(signal, callback)
+    end)
+    return connected
 end
 
 local function connectWebSocket()
@@ -1143,14 +1378,30 @@ local function connectWebSocket()
 
     State.WS = socket
     State.WSConnected = true
-    if not bindSocketEvent(socket, "OnMessage", handleWebSocketMessage) then
-        bindSocketEvent(socket, "Message", handleWebSocketMessage)
+    State.WSReady = false
+    State.WSConnectedAt = os.clock()
+    State.LastWSRxAt = 0
+
+    local messageBound = bindSocketEvent(socket, "OnMessage", handleWebSocketMessage)
+    if not messageBound then
+        messageBound = bindSocketEvent(socket, "Message", handleWebSocketMessage)
+    end
+    if not messageBound then
+        State.LastError = "WebSocket connected but inbound event could not be bound"
+        State.WSConnected = false
+        State.WSReady = false
+        pcall(function()
+            if type(socket.Close) == "function" then socket:Close() end
+            if type(socket.close) == "function" then socket:close() end
+        end)
+        return false
     end
 
     local function onClose()
         if State.WS == socket then
             State.WS = nil
             State.WSConnected = false
+            State.WSReady = false
         end
     end
     if not bindSocketEvent(socket, "OnClose", onClose) then
@@ -1166,16 +1417,41 @@ task.spawn(function()
         if not State.WSConnected or not State.WS then
             State.WS = nil
             State.WSConnected = false
+            State.WSReady = false
             connectWebSocket()
             task.wait(State.WSConnected and 1 or 3)
         else
             local now = os.clock()
-            if now - State.LastClientHeartbeatAt >= Config.ClientHeartbeatInterval then
-                State.LastClientHeartbeatAt = now
-                sendHello()
-                sendClientStatus()
+
+            -- Connected socket but no inbound events usually means the executor's
+            -- signal binding is incompatible or the socket is stale. Reconnect
+            -- instead of showing WS=ON while never receiving shared-room data.
+            local ackTimedOut = (not State.WSReady)
+                and State.WSConnectedAt > 0
+                and (now - State.WSConnectedAt >= Config.WSAckTimeout)
+            local rxStale = State.WSReady
+                and State.LastWSRxAt > 0
+                and (now - State.LastWSRxAt >= Config.WSStaleSeconds)
+
+            if ackTimedOut or rxStale then
+                State.LastError = ackTimedOut and "WebSocket hello_ack timeout" or "WebSocket receive stale"
+                local staleSocket = State.WS
+                State.WS = nil
+                State.WSConnected = false
+                State.WSReady = false
+                pcall(function()
+                    if staleSocket and type(staleSocket.Close) == "function" then staleSocket:Close() end
+                    if staleSocket and type(staleSocket.close) == "function" then staleSocket:close() end
+                end)
+                task.wait(0.25)
+            else
+                if now - State.LastClientHeartbeatAt >= Config.ClientHeartbeatInterval then
+                    State.LastClientHeartbeatAt = now
+                    sendHello()
+                    sendClientStatus()
+                end
+                task.wait(0.25)
             end
-            task.wait(0.5)
         end
     end
 end)
@@ -1275,42 +1551,113 @@ function Browser.scan()
         return shuffled(State.BrowserCache)
     end
 
-    setStatus("Scanning 100-page Server Browser...", "SCANNING", string.format("target players=%d-%d", Config.PreferredPlayersMin, Config.PreferredPlayersMax))
+    setStatus(
+        "Fast scanning Server Browser...",
+        "SCANNING",
+        string.format(
+            "max=%d pages | batch=%d | target players=%d-%d",
+            Config.BrowserMaxPages,
+            Config.BrowserBatchSize,
+            Config.PreferredPlayersMin,
+            Config.PreferredPlayersMax
+        )
+    )
+
     local found = {}
     local seen = {}
-    local startOffset = (Player.UserId % Config.BrowserMaxPages)
+    local startOffset = Player.UserId % Config.BrowserMaxPages
+    local scanned = 0
 
-    for step = 1, Config.BrowserMaxPages do
-        if not State.Running or State.PendingAssignment or State.RoomHint then break end
-        local page = ((startOffset + step - 1) % Config.BrowserMaxPages) + 1
-        local ok, data = pcall(function() return ServerBrowser:InvokeServer(page) end)
-        if ok and type(data) == "table" then
-            for jobId, info in pairs(data) do
-                local count = type(info) == "table" and tonumber(info.Count) or nil
-                if type(jobId) == "string"
-                    and not seen[jobId]
-                    and count
-                    and count >= Config.PreferredPlayersMin
-                    and count <= Config.PreferredPlayersMax
-                    and not jobBlocked(jobId)
-                then
-                    seen[jobId] = true
-                    found[#found + 1] = {
-                        jobId = jobId,
-                        players = count,
-                        region = info.Region,
-                        lastUpdate = info.__LastUpdate,
-                    }
-                end
+    local function processPageData(data)
+        if type(data) ~= "table" then return end
+        for jobId, info in pairs(data) do
+            local count = type(info) == "table" and tonumber(info.Count) or nil
+            if type(jobId) == "string"
+                and not seen[jobId]
+                and count
+                and count >= Config.PreferredPlayersMin
+                and count <= Config.PreferredPlayersMax
+                and not jobBlocked(jobId)
+            then
+                seen[jobId] = true
+                found[#found + 1] = {
+                    jobId = jobId,
+                    players = count,
+                    region = info.Region,
+                    lastUpdate = info.__LastUpdate,
+                }
             end
         end
-        if step % 10 == 0 then
-            setStatus("Scanning Server Browser...", "SCANNING", string.format("page %d/%d | candidates=%d", step, Config.BrowserMaxPages, #found))
-        end
-        task.wait(Config.BrowserPageDelay)
     end
 
-    State.BrowserCacheAt = now
+    -- Max 100 pages is preserved, but pages are fetched in small concurrent
+    -- batches and we leave early once enough 5-6 player candidates exist.
+    -- With 20 tabs, UserId offsets spread the batches across the browser.
+    for batchStart = 1, Config.BrowserMaxPages, Config.BrowserBatchSize do
+        if not State.Running or State.PendingAssignment or State.RoomHint then break end
+
+        local batchEnd = math.min(
+            Config.BrowserMaxPages,
+            batchStart + Config.BrowserBatchSize - 1
+        )
+        local results = {}
+        local pending = 0
+
+        for step = batchStart, batchEnd do
+            pending += 1
+            local capturedStep = step
+            local page = ((startOffset + capturedStep - 1) % Config.BrowserMaxPages) + 1
+
+            task.spawn(function()
+                local ok, data = pcall(function()
+                    return ServerBrowser:InvokeServer(page)
+                end)
+                results[capturedStep] = ok and data or false
+                pending -= 1
+            end)
+        end
+
+        local deadline = os.clock() + Config.BrowserBatchTimeout
+        while State.Running
+            and pending > 0
+            and os.clock() < deadline
+            and not State.PendingAssignment
+            and not State.RoomHint
+        do
+            task.wait()
+        end
+
+        if State.PendingAssignment or State.RoomHint then break end
+
+        for step = batchStart, batchEnd do
+            scanned += 1
+            processPageData(results[step])
+        end
+
+        setStatus(
+            "Fast scanning Server Browser...",
+            "SCANNING",
+            string.format(
+                "pages=%d/%d | candidates=%d | batch=%d",
+                scanned,
+                Config.BrowserMaxPages,
+                #found,
+                Config.BrowserBatchSize
+            )
+        )
+
+        if #found >= Config.BrowserTargetCandidates then
+            break
+        end
+
+        if Config.BrowserPageDelay > 0 then
+            task.wait(Config.BrowserPageDelay)
+        else
+            task.wait()
+        end
+    end
+
+    State.BrowserCacheAt = os.clock()
     State.BrowserCache = found
     return shuffled(found)
 end
