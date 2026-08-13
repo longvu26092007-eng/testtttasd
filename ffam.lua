@@ -1,0 +1,1553 @@
+--[[
+    KATAKURI COORDINATOR CLIENT
+    Standalone Cake Prince farm + 20-tab shared server coordination.
+
+    Design goals:
+      - Team is always Marines.
+      - No quest taking.
+      - Cake Prince only (no Dough King).
+      - Qualified server = CakePrinceSpawner remaining <= 100, spawn-ready, or Cake Prince exists.
+      - All clients scout. Shared qualified rooms are filled until Roblox reports full.
+      - Server Browser only, max 100 pages, candidate servers target 5-6 players.
+      - Local WebSocket coordinator shares rooms, reservations, candidate claims and bad-server TTLs.
+      - One state machine owns movement/combat/hop decisions.
+]]
+
+repeat task.wait(0.25) until game:IsLoaded()
+    and game:GetService("Players").LocalPlayer
+    and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
+
+-- ============================================================================
+-- [01] CONFIG
+-- ============================================================================
+local ENV = getgenv()
+ENV.KatakuriConfig = ENV.KatakuriConfig or {}
+local UserConfig = ENV.KatakuriConfig
+
+local Config = {
+    -- Team is intentionally fixed by spec.
+    Team = "Marines",
+
+    -- Cake Prince progress.
+    TotalRequired = tonumber(UserConfig.TotalRequired) or 500,
+    QualifiedRemaining = tonumber(UserConfig.QualifiedRemaining) or 100,
+    ProgressPollInterval = tonumber(UserConfig.ProgressPollInterval) or 0.80,
+    ProgressUnknownGrace = tonumber(UserConfig.ProgressUnknownGrace) or 3.0,
+
+    -- Roblox Server Browser.
+    BrowserMaxPages = math.clamp(tonumber(UserConfig.BrowserMaxPages) or 100, 1, 100),
+    PreferredPlayersMin = tonumber(UserConfig.PreferredPlayersMin) or 5,
+    PreferredPlayersMax = tonumber(UserConfig.PreferredPlayersMax) or 6,
+    BrowserPageDelay = tonumber(UserConfig.BrowserPageDelay) or 0.025,
+    BrowserCacheSeconds = tonumber(UserConfig.BrowserCacheSeconds) or 7,
+    CandidateLocalBlacklistSeconds = tonumber(UserConfig.CandidateLocalBlacklistSeconds) or 150,
+    TeleportWaitSeconds = tonumber(UserConfig.TeleportWaitSeconds) or 8,
+
+    -- Local coordinator.
+    EnableWebSocket = UserConfig.EnableWebSocket ~= false,
+    WSUrl = tostring(UserConfig.WSUrl or "ws://127.0.0.1:9877"),
+    RoomRequestInterval = tonumber(UserConfig.RoomRequestInterval) or 1.0,
+    RoomHeartbeatInterval = tonumber(UserConfig.RoomHeartbeatInterval) or 1.25,
+    ClientHeartbeatInterval = tonumber(UserConfig.ClientHeartbeatInterval) or 8,
+    SharedRoomWaitBeforeBrowser = tonumber(UserConfig.SharedRoomWaitBeforeBrowser) or 0.65,
+    ClaimReplyTimeout = tonumber(UserConfig.ClaimReplyTimeout) or 1.0,
+
+    -- Farm/combat.
+    TweenSpeed = tonumber(UserConfig.TweenSpeed) or 300,
+    MobHoverHeight = tonumber(UserConfig.MobHoverHeight) or 20,
+    BossHoverHeight = tonumber(UserConfig.BossHoverHeight) or 25,
+    BringRadius = tonumber(UserConfig.BringRadius) or 350,
+    AttackRadius = tonumber(UserConfig.AttackRadius) or 70,
+    SpawnerCooldown = tonumber(UserConfig.SpawnerCooldown) or 1.5,
+    MirrorTouchCooldown = tonumber(UserConfig.MirrorTouchCooldown) or 1.5,
+
+    -- UI/debug.
+    UIUpdateInterval = tonumber(UserConfig.UIUpdateInterval) or 0.45,
+    Debug = UserConfig.Debug == true,
+}
+
+if Config.PreferredPlayersMin > Config.PreferredPlayersMax then
+    Config.PreferredPlayersMin, Config.PreferredPlayersMax = Config.PreferredPlayersMax, Config.PreferredPlayersMin
+end
+
+-- ============================================================================
+-- [02] SERVICES / CONSTANTS
+-- ============================================================================
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local HttpService = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local VirtualUser = game:GetService("VirtualUser")
+local StarterGui = game:GetService("StarterGui")
+local CoreGui = game:GetService("CoreGui")
+
+local Player = Players.LocalPlayer
+local COMMF_ = ReplicatedStorage:WaitForChild("Remotes"):WaitForChild("CommF_")
+local ServerBrowser = ReplicatedStorage:WaitForChild("__ServerBrowser")
+local Enemies = workspace:WaitForChild("Enemies")
+
+local CAKE_MOBS = {
+    ["Cookie Crafter"] = true,
+    ["Cake Guard"] = true,
+    ["Baking Staff"] = true,
+    ["Head Baker"] = true,
+}
+
+local SEA3_PLACE_IDS = {
+    [7449423635] = true,
+    [100117331123089] = true,
+}
+
+local function debugPrint(...)
+    if Config.Debug then
+        print("[KATAKURI]", ...)
+    end
+end
+
+-- Stop older execution cleanly if re-executed.
+if type(ENV.__KATAKURI_COORDINATOR_STOP) == "function" then
+    pcall(ENV.__KATAKURI_COORDINATOR_STOP)
+end
+
+local State = {
+    Running = true,
+    Phase = "BOOT",
+    Status = "Starting...",
+    Extra = "",
+
+    Character = nil,
+    Humanoid = nil,
+    Root = nil,
+
+    Progress = nil,
+    ProgressRaw = nil,
+    LastProgressAt = 0,
+    UnknownSince = nil,
+
+    InQualifiedRoom = false,
+    QualifiedSince = nil,
+    BossWasSeen = false,
+    LastSpawnerAt = 0,
+    LastMirrorTouchAt = 0,
+
+    WS = nil,
+    WSConnected = false,
+    CoordinatorClients = 0,
+    CoordinatorRooms = 0,
+    LastRoomRequestAt = 0,
+    LastRoomHeartbeatAt = 0,
+    LastClientHeartbeatAt = 0,
+    PendingAssignment = nil,
+    RoomHint = false,
+    ForceLeaveRoom = false,
+    ClaimReplies = {},
+    RequestCounter = 0,
+
+    TeleportTarget = nil,
+    TeleportReservationId = nil,
+    TeleportFailed = nil,
+
+    BrowserCacheAt = 0,
+    BrowserCache = nil,
+    Hopping = false,
+
+    LastBadReportJob = nil,
+    LastBadReportAt = 0,
+    LastError = "",
+}
+
+ENV.__KATAKURI_COORDINATOR_STOP = function()
+    State.Running = false
+end
+
+local function setStatus(status, phase, extra)
+    if phase then State.Phase = phase end
+    State.Status = tostring(status or "")
+    State.Extra = tostring(extra or "")
+end
+
+-- ============================================================================
+-- [03] CHARACTER / TEAM
+-- ============================================================================
+local function bindCharacter(character)
+    State.Character = character
+    State.Humanoid = character:WaitForChild("Humanoid", 10)
+    State.Root = character:WaitForChild("HumanoidRootPart", 10)
+end
+
+if Player.Character then
+    task.spawn(bindCharacter, Player.Character)
+end
+Player.CharacterAdded:Connect(bindCharacter)
+
+local function currentTeamName()
+    return Player.Team and tostring(Player.Team.Name) or "NONE"
+end
+
+local function clickMarineTeamButton()
+    local pg = Player:FindFirstChildOfClass("PlayerGui")
+    if not pg then return false end
+
+    local main = pg:FindFirstChild("Main (minimal)") or pg:FindFirstChild("Main")
+    local choose = main and main:FindFirstChild("ChooseTeam", true)
+    local container = choose and choose:FindFirstChild("Container")
+    local marines = container and container:FindFirstChild("Marines")
+    if not marines then return false end
+
+    for _, obj in ipairs(marines:GetDescendants()) do
+        if obj:IsA("GuiButton") then
+            local ok = pcall(function()
+                if type(firesignal) == "function" then
+                    firesignal(obj.Activated)
+                else
+                    obj:Activate()
+                end
+            end)
+            if ok then return true end
+        end
+    end
+    return false
+end
+
+local function ensureMarines()
+    if currentTeamName() == Config.Team then return true end
+
+    setStatus("Choosing Marines...", "TEAM")
+    for _ = 1, 20 do
+        if not State.Running then return false end
+        if currentTeamName() == Config.Team then return true end
+
+        pcall(function()
+            COMMF_:InvokeServer("SetTeam", Config.Team)
+        end)
+        task.wait(0.35)
+
+        if currentTeamName() == Config.Team then return true end
+        pcall(clickMarineTeamButton)
+        task.wait(0.35)
+    end
+    return currentTeamName() == Config.Team
+end
+
+local function isSea3()
+    if SEA3_PLACE_IDS[game.PlaceId] then return true end
+    local map = workspace:GetAttribute("MAP")
+    return tostring(map or ""):lower():find("sea3", 1, true) ~= nil
+        or tostring(map or ""):match("3") ~= nil
+end
+
+-- ============================================================================
+-- [04] LIGHTWEIGHT UI
+-- ============================================================================
+local UI = {}
+
+local function uiParent()
+    local ok, parent = pcall(function()
+        if type(gethui) == "function" then return gethui() end
+        return CoreGui
+    end)
+    return ok and parent or Player:WaitForChild("PlayerGui")
+end
+
+local function createUI()
+    local parent = uiParent()
+    pcall(function()
+        local old = parent:FindFirstChild("KatakuriCoordinatorUI")
+        if old then old:Destroy() end
+    end)
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "KatakuriCoordinatorUI"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 50
+    gui.Parent = parent
+
+    local frame = Instance.new("Frame")
+    frame.Name = "Main"
+    frame.Position = UDim2.fromOffset(18, 110)
+    frame.Size = UDim2.fromOffset(360, 270)
+    frame.BackgroundColor3 = Color3.fromRGB(16, 17, 21)
+    frame.BackgroundTransparency = 0.05
+    frame.BorderSizePixel = 0
+    frame.Active = true
+    frame.Draggable = true
+    frame.Parent = gui
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 10)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.Color = Color3.fromRGB(100, 130, 255)
+    stroke.Parent = frame
+
+    local title = Instance.new("TextLabel")
+    title.Position = UDim2.fromOffset(12, 8)
+    title.Size = UDim2.new(1, -52, 0, 26)
+    title.BackgroundTransparency = 1
+    title.Font = Enum.Font.GothamBold
+    title.TextSize = 16
+    title.TextColor3 = Color3.fromRGB(180, 195, 255)
+    title.TextXAlignment = Enum.TextXAlignment.Left
+    title.Text = "KATAKURI COORDINATOR"
+    title.Parent = frame
+
+    local minimize = Instance.new("TextButton")
+    minimize.Position = UDim2.new(1, -40, 0, 7)
+    minimize.Size = UDim2.fromOffset(30, 26)
+    minimize.BackgroundColor3 = Color3.fromRGB(35, 37, 44)
+    minimize.BorderSizePixel = 0
+    minimize.Font = Enum.Font.GothamBold
+    minimize.Text = "—"
+    minimize.TextSize = 16
+    minimize.TextColor3 = Color3.fromRGB(235, 235, 240)
+    minimize.Parent = frame
+    Instance.new("UICorner", minimize).CornerRadius = UDim.new(0, 6)
+
+    local content = Instance.new("Frame")
+    content.Position = UDim2.fromOffset(10, 42)
+    content.Size = UDim2.new(1, -20, 1, -52)
+    content.BackgroundTransparency = 1
+    content.Parent = frame
+
+    local labels = {}
+    local names = {"Player", "Team", "State", "Server", "Progress", "Coordinator", "Room", "Status"}
+    for i, name in ipairs(names) do
+        local l = Instance.new("TextLabel")
+        l.Name = name
+        l.Position = UDim2.fromOffset(0, (i - 1) * 25)
+        l.Size = UDim2.new(1, 0, 0, name == "Status" and 40 or 23)
+        l.BackgroundTransparency = name == "Status" and 0.15 or 1
+        l.BackgroundColor3 = Color3.fromRGB(30, 31, 37)
+        l.BorderSizePixel = 0
+        l.Font = Enum.Font.GothamSemibold
+        l.TextSize = name == "Status" and 12 or 13
+        l.TextColor3 = Color3.fromRGB(225, 225, 232)
+        l.TextXAlignment = Enum.TextXAlignment.Left
+        l.TextYAlignment = Enum.TextYAlignment.Center
+        l.TextWrapped = true
+        l.Text = name .. ": ..."
+        l.Parent = content
+        if name == "Status" then
+            Instance.new("UICorner", l).CornerRadius = UDim.new(0, 6)
+            local pad = Instance.new("UIPadding")
+            pad.PaddingLeft = UDim.new(0, 7)
+            pad.PaddingRight = UDim.new(0, 7)
+            pad.Parent = l
+        end
+        labels[name] = l
+    end
+
+    local minimized = false
+    minimize.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        content.Visible = not minimized
+        frame.Size = minimized and UDim2.fromOffset(360, 42) or UDim2.fromOffset(360, 270)
+        minimize.Text = minimized and "+" or "—"
+    end)
+
+    UI.Gui = gui
+    UI.Frame = frame
+    UI.Labels = labels
+end
+
+createUI()
+
+task.spawn(function()
+    while State.Running do
+        pcall(function()
+            if not UI.Gui or not UI.Gui.Parent then createUI() end
+            local labels = UI.Labels
+            local progress = State.Progress
+            local remainingText = progress and progress.known
+                and (progress.ready and "READY" or tostring(progress.remaining))
+                or "?"
+            local killedText = progress and progress.known and tostring(progress.killed or "?") or "?"
+
+            labels.Player.Text = "Player: " .. Player.Name
+            labels.Team.Text = "Team: " .. currentTeamName() .. " (forced Marines)"
+            labels.State.Text = "State: " .. State.Phase
+            labels.Server.Text = string.format("Server: %d/%d | %s", #Players:GetPlayers(), Players.MaxPlayers, string.sub(game.JobId, 1, 10))
+            labels.Progress.Text = string.format("Progress: remaining=%s | killed=%s/%d", remainingText, killedText, Config.TotalRequired)
+            labels.Coordinator.Text = string.format("WS: %s | clients=%d | rooms=%d", State.WSConnected and "ON" or "OFF", State.CoordinatorClients, State.CoordinatorRooms)
+            labels.Room.Text = "Room: " .. (State.InQualifiedRoom and "QUALIFIED / SHARING" or "SCOUT")
+            labels.Status.Text = "Status: " .. State.Status .. (State.Extra ~= "" and ("\n" .. State.Extra) or "")
+        end)
+        task.wait(Config.UIUpdateInterval)
+    end
+end)
+
+-- ============================================================================
+-- [05] MOVEMENT CONTROLLER - one Heartbeat / one proxy
+-- ============================================================================
+local Movement = {
+    Proxy = nil,
+    Tween = nil,
+    Active = false,
+    Target = nil,
+    LastRetargetAt = 0,
+}
+
+local function ensureProxy()
+    if Movement.Proxy and Movement.Proxy.Parent then return Movement.Proxy end
+    local p = Instance.new("Part")
+    p.Name = "KatakuriMoveProxy"
+    p.Anchored = true
+    p.CanCollide = false
+    p.CanTouch = false
+    p.CanQuery = false
+    p.Transparency = 1
+    p.Size = Vector3.new(2, 2, 2)
+    p.Parent = workspace
+    Movement.Proxy = p
+    return p
+end
+
+function Movement.cancel()
+    Movement.Active = false
+    Movement.Target = nil
+    if Movement.Tween then
+        pcall(function() Movement.Tween:Cancel() end)
+        Movement.Tween = nil
+    end
+end
+
+function Movement.moveTo(targetCFrame, speed)
+    local root = State.Root
+    local hum = State.Humanoid
+    if not root or not hum or hum.Health <= 0 or typeof(targetCFrame) ~= "CFrame" then return false end
+
+    hum.Sit = false
+    local dist = (root.Position - targetCFrame.Position).Magnitude
+    if dist <= 6 then
+        Movement.cancel()
+        pcall(function()
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            root.CFrame = targetCFrame
+        end)
+        return true
+    end
+
+    local now = os.clock()
+    if Movement.Active and Movement.Target then
+        local targetDelta = (Movement.Target.Position - targetCFrame.Position).Magnitude
+        if targetDelta < 12 and now - Movement.LastRetargetAt < 0.35 then
+            return false
+        end
+    end
+
+    local proxy = ensureProxy()
+    if Movement.Tween then pcall(function() Movement.Tween:Cancel() end) end
+    proxy.CFrame = root.CFrame
+    Movement.Target = targetCFrame
+    Movement.Active = true
+    Movement.LastRetargetAt = now
+
+    local travel = math.max(dist / (tonumber(speed) or Config.TweenSpeed), 0.05)
+    Movement.Tween = TweenService:Create(proxy, TweenInfo.new(travel, Enum.EasingStyle.Linear), {CFrame = targetCFrame})
+    Movement.Tween:Play()
+    return false
+end
+
+RunService.Heartbeat:Connect(function()
+    if not State.Running or not Movement.Active then return end
+    local root = State.Root
+    local hum = State.Humanoid
+    local proxy = Movement.Proxy
+    if not root or not hum or hum.Health <= 0 or not proxy or not proxy.Parent then
+        Movement.cancel()
+        return
+    end
+    pcall(function()
+        hum.Sit = false
+        root.AssemblyLinearVelocity = Vector3.zero
+        root.AssemblyAngularVelocity = Vector3.zero
+        root.CFrame = proxy.CFrame
+    end)
+end)
+
+-- ============================================================================
+-- [06] CAKE PROGRESS / BOSS DETECTION
+-- ============================================================================
+local function getCakeMap()
+    local map = workspace:FindFirstChild("Map")
+    return map and map:FindFirstChild("CakeLoaf")
+end
+
+local function getMirrorParts()
+    local cake = getCakeMap()
+    local mirror = cake and cake:FindFirstChild("BigMirror")
+    if not mirror then return nil, nil end
+    return mirror:FindFirstChild("Main"), mirror:FindFirstChild("Other")
+end
+
+local function findCakePrince(container)
+    if not container then return nil end
+    for _, obj in ipairs(container:GetChildren()) do
+        if obj:IsA("Model") and string.find(string.lower(obj.Name), "cake prince", 1, true) then
+            local hum = obj:FindFirstChildOfClass("Humanoid")
+            local root = obj:FindFirstChild("HumanoidRootPart")
+            if root and (not hum or hum.Health > 0) then
+                return obj
+            end
+        end
+    end
+    return nil
+end
+
+local function activeCakePrince()
+    return findCakePrince(Enemies)
+end
+
+local function storedCakePrince()
+    return findCakePrince(ReplicatedStorage)
+end
+
+local function mirrorOpen()
+    local _, other = getMirrorParts()
+    if not other or not other:IsA("BasePart") then return false end
+    return other.Transparency == 0
+end
+
+local function queryProgress(force)
+    local now = os.clock()
+    if not force and State.Progress and now - State.LastProgressAt < Config.ProgressPollInterval then
+        return State.Progress
+    end
+
+    State.LastProgressAt = now
+    local ok, raw = pcall(function()
+        return COMMF_:InvokeServer("CakePrinceSpawner")
+    end)
+
+    local result = {
+        known = false,
+        ready = false,
+        remaining = nil,
+        killed = nil,
+        raw = raw,
+    }
+
+    if ok then
+        local rawString = raw ~= nil and tostring(raw) or nil
+        local number = rawString and tonumber(string.match(rawString, "%d+")) or nil
+        if number then
+            number = math.clamp(number, 0, Config.TotalRequired)
+            result.known = true
+            result.remaining = number
+            result.killed = Config.TotalRequired - number
+            result.ready = number <= 0
+        elseif rawString and rawString ~= "" then
+            -- Source variants use the no-number response as spawn-ready.
+            result.known = true
+            result.ready = true
+            result.remaining = 0
+            result.killed = Config.TotalRequired
+        elseif activeCakePrince() or storedCakePrince() or mirrorOpen() then
+            result.known = true
+            result.ready = true
+            result.remaining = 0
+            result.killed = Config.TotalRequired
+        end
+    end
+
+    State.Progress = result
+    State.ProgressRaw = raw
+    if result.known then
+        State.UnknownSince = nil
+    elseif not State.UnknownSince then
+        State.UnknownSince = now
+    end
+    return result
+end
+
+local function currentBossState(progress)
+    if activeCakePrince() or storedCakePrince() then return "BOSS" end
+    if progress and progress.known and progress.ready then return "READY" end
+    if progress and progress.known and progress.remaining and progress.remaining <= Config.QualifiedRemaining then
+        return "FARMING"
+    end
+    return "NONE"
+end
+
+local function isQualified(progress)
+    if activeCakePrince() or storedCakePrince() then return true end
+    if not progress or not progress.known then return false end
+    return progress.ready or (progress.remaining and progress.remaining <= Config.QualifiedRemaining)
+end
+
+-- ============================================================================
+-- [07] COMBAT - scoped only to Cake mobs / Cake Prince
+-- ============================================================================
+local Attack = {
+    RemoteAttack = nil,
+    RemoteAttackId = nil,
+    Seed = nil,
+    LastAttackAt = 0,
+    LastKenAt = 0,
+}
+
+pcall(function()
+    Attack.Seed = ReplicatedStorage.Modules.Net.seed:InvokeServer()
+end)
+
+task.spawn(function()
+    local containers = {
+        ReplicatedStorage:FindFirstChild("Util"),
+        ReplicatedStorage:FindFirstChild("Common"),
+        ReplicatedStorage:FindFirstChild("Remotes"),
+        ReplicatedStorage:FindFirstChild("Assets"),
+        ReplicatedStorage:FindFirstChild("FX"),
+    }
+    for _, folder in ipairs(containers) do
+        if folder then
+            for _, obj in ipairs(folder:GetChildren()) do
+                if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+                    Attack.RemoteAttack = obj
+                    Attack.RemoteAttackId = obj:GetAttribute("Id")
+                end
+            end
+            folder.ChildAdded:Connect(function(obj)
+                if obj:IsA("RemoteEvent") and obj:GetAttribute("Id") then
+                    Attack.RemoteAttack = obj
+                    Attack.RemoteAttackId = obj:GetAttribute("Id")
+                end
+            end)
+        end
+    end
+end)
+
+local function equipMelee()
+    local character = State.Character
+    local hum = State.Humanoid
+    if not character or not hum then return false end
+
+    local current = character:FindFirstChildOfClass("Tool")
+    if current and tostring(current.ToolTip) == "Melee" then return true end
+
+    for _, tool in ipairs(Player.Backpack:GetChildren()) do
+        if tool:IsA("Tool") and tostring(tool.ToolTip) == "Melee" then
+            pcall(function() hum:EquipTool(tool) end)
+            return true
+        end
+    end
+    return current ~= nil
+end
+
+local function aliveModel(model)
+    if not model or not model.Parent then return false end
+    local hum = model:FindFirstChildOfClass("Humanoid")
+    local root = model:FindFirstChild("HumanoidRootPart")
+    return hum and root and hum.Health > 0
+end
+
+local function fastAttackModels(models)
+    if os.clock() - Attack.LastAttackAt < 0.02 then return end
+    if not State.Root or not State.Humanoid or State.Humanoid.Health <= 0 then return end
+    if not State.Character or not State.Character:FindFirstChildOfClass("Tool") then return end
+
+    local valid = {}
+    for _, model in ipairs(models or {}) do
+        if aliveModel(model) then
+            local root = model.HumanoidRootPart
+            if (root.Position - State.Root.Position).Magnitude <= Config.AttackRadius then
+                valid[#valid + 1] = model
+            end
+        end
+    end
+    if #valid == 0 then return end
+
+    local payload = {[2] = {}}
+    for _, model in ipairs(valid) do
+        local part = model:FindFirstChild("Head") or model:FindFirstChild("HumanoidRootPart")
+        if part then
+            payload[1] = payload[1] or part
+            payload[2][#payload[2] + 1] = {model, part}
+        end
+    end
+    if not payload[1] then return end
+
+    pcall(function()
+        local net = ReplicatedStorage:FindFirstChild("Modules") and ReplicatedStorage.Modules:FindFirstChild("Net")
+        if not net then return end
+        local registerAttack = net:FindFirstChild("RE/RegisterAttack")
+        local registerHit = net:FindFirstChild("RE/RegisterHit")
+        if registerAttack then registerAttack:FireServer() end
+        if registerHit then registerHit:FireServer(unpack(payload)) end
+    end)
+
+    pcall(function()
+        if Attack.RemoteAttack and Attack.RemoteAttackId and Attack.Seed then
+            Attack.RemoteAttack:FireServer(
+                string.gsub("RE/RegisterHit", ".", function(c)
+                    return string.char(bit32.bxor(string.byte(c), math.floor(workspace:GetServerTimeNow() / 10 % 10) + 1))
+                end),
+                bit32.bxor(Attack.RemoteAttackId + 909090, Attack.Seed * 2),
+                unpack(payload)
+            )
+        end
+    end)
+
+    Attack.LastAttackAt = os.clock()
+end
+
+local function cakeMobList()
+    local list = {}
+    for _, mob in ipairs(Enemies:GetChildren()) do
+        if CAKE_MOBS[mob.Name] and aliveModel(mob) then
+            list[#list + 1] = mob
+        end
+    end
+    return list
+end
+
+local function nearestCakeMob()
+    local root = State.Root
+    if not root then return nil end
+    local best, bestDist
+    for _, mob in ipairs(cakeMobList()) do
+        local d = (mob.HumanoidRootPart.Position - root.Position).Magnitude
+        if not bestDist or d < bestDist then
+            best, bestDist = mob, d
+        end
+    end
+    return best, bestDist
+end
+
+local function bringCakeMobs(anchorCFrame)
+    if typeof(anchorCFrame) ~= "CFrame" then return end
+    pcall(function() setscriptable(Player, "SimulationRadius", true) end)
+    pcall(function() sethiddenproperty(Player, "SimulationRadius", math.huge) end)
+
+    local index = 0
+    for _, mob in ipairs(cakeMobList()) do
+        local root = mob:FindFirstChild("HumanoidRootPart")
+        local hum = mob:FindFirstChildOfClass("Humanoid")
+        if root and hum and (root.Position - anchorCFrame.Position).Magnitude <= Config.BringRadius then
+            local owns = true
+            if type(isnetworkowner) == "function" then
+                local ok, result = pcall(isnetworkowner, root)
+                owns = ok and result or false
+            end
+            if owns then
+                index += 1
+                pcall(function()
+                    root.AssemblyLinearVelocity = Vector3.zero
+                    root.AssemblyAngularVelocity = Vector3.zero
+                    root.CanCollide = false
+                    root.Size = Vector3.new(55, 55, 55)
+                    hum.WalkSpeed = 0
+                    hum.JumpPower = 0
+                    root.CFrame = anchorCFrame * CFrame.new((index - 1) * 1.5, 0, 0)
+                end)
+            end
+        end
+    end
+end
+
+local function farmCakeMobStep(progress)
+    local mob = nearestCakeMob()
+    if not mob then
+        setStatus("Waiting Cake mobs...", "FARM_MOBS", progress and progress.remaining and ("remaining=" .. progress.remaining) or "")
+        local cake = getCakeMap()
+        local respawn = cake and cake:FindFirstChild("RespawnPart")
+        if respawn and respawn:IsA("BasePart") then
+            Movement.moveTo(respawn.CFrame * CFrame.new(0, 15, 0))
+        else
+            Movement.moveTo(CFrame.new(-2100, 85, -12130))
+        end
+        return
+    end
+
+    local anchor = mob.HumanoidRootPart.CFrame
+    bringCakeMobs(anchor)
+    equipMelee()
+    Movement.moveTo(anchor * CFrame.new(0, Config.MobHoverHeight, 0))
+    fastAttackModels(cakeMobList())
+
+    if os.clock() - Attack.LastKenAt >= 10 then
+        Attack.LastKenAt = os.clock()
+        pcall(function() ReplicatedStorage.Remotes.CommE:FireServer("Ken", true) end)
+    end
+
+    setStatus(
+        "Farming " .. mob.Name,
+        "FARM_MOBS",
+        string.format("remaining=%s | killed=%s/%d", tostring(progress.remaining), tostring(progress.killed), Config.TotalRequired)
+    )
+end
+
+local function touchMirror()
+    if os.clock() - State.LastMirrorTouchAt < Config.MirrorTouchCooldown then return end
+    local root = State.Root
+    local main = getMirrorParts()
+    if not root or not main or not main:IsA("BasePart") then return end
+
+    State.LastMirrorTouchAt = os.clock()
+    Movement.moveTo(main.CFrame * CFrame.new(0, 4, 0))
+    if (root.Position - main.Position).Magnitude <= 15 and type(firetouchinterest) == "function" then
+        pcall(function()
+            firetouchinterest(root, main, 0)
+            task.wait(0.08)
+            firetouchinterest(root, main, 1)
+        end)
+    end
+end
+
+local function spawnCakePrinceStep()
+    setStatus("Spawning Cake Prince...", "SPAWN_BOSS")
+    if os.clock() - State.LastSpawnerAt >= Config.SpawnerCooldown then
+        State.LastSpawnerAt = os.clock()
+        pcall(function() COMMF_:InvokeServer("CakePrinceSpawner", true) end)
+    end
+    touchMirror()
+end
+
+local function killCakePrinceStep()
+    local boss = activeCakePrince()
+    if not boss then
+        local stored = storedCakePrince()
+        if stored then
+            setStatus("Cake Prince detected - entering mirror...", "ENTER_BOSS")
+            touchMirror()
+        else
+            setStatus("Waiting Cake Prince model...", "WAIT_BOSS")
+            touchMirror()
+        end
+        return
+    end
+
+    -- The Ghoul/Cyborg source enters BigMirror before attacking Cake Prince.
+    -- Keep that gate so movement never races the dimension transition.
+    if tostring(Player:GetAttribute("CurrentLocation") or "") ~= "Dimensional Shift" then
+        local mirrorMain = getMirrorParts()
+        if mirrorMain then
+            setStatus("Cake Prince active - entering Dimensional Shift", "ENTER_BOSS")
+            touchMirror()
+            return
+        end
+    end
+
+    State.BossWasSeen = true
+    equipMelee()
+    local root = boss:FindFirstChild("HumanoidRootPart")
+    if root then
+        Movement.moveTo(root.CFrame * CFrame.new(0, Config.BossHoverHeight, 0))
+        fastAttackModels({boss})
+    end
+    setStatus("Killing Cake Prince", "KILL_BOSS", boss:FindFirstChildOfClass("Humanoid") and ("HP=" .. math.floor(boss.Humanoid.Health)) or "")
+end
+
+-- ============================================================================
+-- [08] VISITED SERVER CACHE (per account, persists across teleports)
+-- ============================================================================
+local VISITED_FILE = "KatakuriVisited_" .. tostring(Player.UserId) .. ".json"
+local Visited = {}
+
+local function loadVisited()
+    if type(isfile) ~= "function" or type(readfile) ~= "function" then return end
+    if not isfile(VISITED_FILE) then return end
+    local ok, decoded = pcall(function()
+        return HttpService:JSONDecode(readfile(VISITED_FILE))
+    end)
+    if ok and type(decoded) == "table" then Visited = decoded end
+end
+
+local function saveVisited()
+    if type(writefile) ~= "function" then return end
+    pcall(function() writefile(VISITED_FILE, HttpService:JSONEncode(Visited)) end)
+end
+
+local function cleanupVisited()
+    local now = os.time()
+    local changed = false
+    for jobId, expiresAt in pairs(Visited) do
+        if tonumber(expiresAt) == nil or tonumber(expiresAt) <= now then
+            Visited[jobId] = nil
+            changed = true
+        end
+    end
+    if changed then saveVisited() end
+end
+
+local function blockJob(jobId, seconds)
+    if type(jobId) ~= "string" or jobId == "" then return end
+    Visited[jobId] = os.time() + (tonumber(seconds) or Config.CandidateLocalBlacklistSeconds)
+    saveVisited()
+end
+
+local function jobBlocked(jobId)
+    if type(jobId) ~= "string" or jobId == "" or jobId == game.JobId then return true end
+    local expires = tonumber(Visited[jobId])
+    if not expires then return false end
+    if expires <= os.time() then
+        Visited[jobId] = nil
+        return false
+    end
+    return true
+end
+
+loadVisited()
+cleanupVisited()
+
+-- ============================================================================
+-- [09] WEBSOCKET COORDINATOR CLIENT
+-- ============================================================================
+local function getWebSocketConnector()
+    if type(ENV.WebSocket) == "table" and type(ENV.WebSocket.connect) == "function" then return ENV.WebSocket.connect end
+    if type(ENV.websocket) == "table" and type(ENV.websocket.connect) == "function" then return ENV.websocket.connect end
+    if type(ENV.syn) == "table" and type(ENV.syn.websocket) == "table" and type(ENV.syn.websocket.connect) == "function" then return ENV.syn.websocket.connect end
+    if type(WebSocket) == "table" and type(WebSocket.connect) == "function" then return WebSocket.connect end
+    return nil
+end
+
+local function wsSend(payload)
+    local socket = State.WS
+    if not socket or not State.WSConnected then return false end
+    local encoded = HttpService:JSONEncode(payload)
+    local ok = pcall(function()
+        if type(socket.Send) == "function" then
+            socket:Send(encoded)
+        elseif type(socket.send) == "function" then
+            socket:send(encoded)
+        else
+            error("WebSocket send method unavailable")
+        end
+    end)
+    if not ok then
+        State.WSConnected = false
+    end
+    return ok
+end
+
+local function nextRequestId(prefix)
+    State.RequestCounter += 1
+    return string.format("%s:%d:%d:%d", prefix or "r", Player.UserId, os.time(), State.RequestCounter)
+end
+
+local function clientMeta(messageType)
+    return {
+        type = messageType,
+        version = 1,
+        player = Player.Name,
+        userId = Player.UserId,
+        placeId = game.PlaceId,
+        jobId = game.JobId,
+        playerCount = #Players:GetPlayers(),
+        maxPlayers = Players.MaxPlayers,
+        state = State.Phase,
+    }
+end
+
+local function sendHello()
+    return wsSend(clientMeta("hello"))
+end
+
+local function sendClientStatus()
+    local data = clientMeta("client_status")
+    data.qualified = State.InQualifiedRoom
+    data.status = State.Status
+    return wsSend(data)
+end
+
+local function publishRoom(progress)
+    if not State.WSConnected then return false end
+    local bossState = currentBossState(progress)
+    if bossState == "NONE" then return false end
+
+    local remaining = progress and progress.known and progress.remaining or 0
+    return wsSend({
+        type = "room_update",
+        player = Player.Name,
+        userId = Player.UserId,
+        placeId = game.PlaceId,
+        jobId = game.JobId,
+        playerCount = #Players:GetPlayers(),
+        maxPlayers = Players.MaxPlayers,
+        remaining = tonumber(remaining) or 0,
+        killed = Config.TotalRequired - (tonumber(remaining) or 0),
+        bossState = bossState,
+        qualifiedRemaining = Config.QualifiedRemaining,
+        sentAt = os.time(),
+    })
+end
+
+local function closeRoom(reason)
+    if State.WSConnected then
+        wsSend({
+            type = "room_close",
+            player = Player.Name,
+            userId = Player.UserId,
+            placeId = game.PlaceId,
+            jobId = game.JobId,
+            reason = tostring(reason or "closed"),
+        })
+    end
+end
+
+local function reportCurrentBad(progress, reason)
+    local now = os.clock()
+    if State.LastBadReportJob == game.JobId and now - State.LastBadReportAt < 10 then return end
+    State.LastBadReportJob = game.JobId
+    State.LastBadReportAt = now
+
+    wsSend({
+        type = "candidate_bad",
+        player = Player.Name,
+        userId = Player.UserId,
+        placeId = game.PlaceId,
+        jobId = game.JobId,
+        playerCount = #Players:GetPlayers(),
+        maxPlayers = Players.MaxPlayers,
+        remaining = progress and progress.remaining or nil,
+        reason = tostring(reason or "not_qualified"),
+    })
+end
+
+local function requestSharedRoom(force)
+    local now = os.clock()
+    if not force and now - State.LastRoomRequestAt < Config.RoomRequestInterval then return false end
+    State.LastRoomRequestAt = now
+    State.RoomHint = false
+    return wsSend({
+        type = "request_room",
+        requestId = nextRequestId("room"),
+        player = Player.Name,
+        userId = Player.UserId,
+        placeId = game.PlaceId,
+        jobId = game.JobId,
+        playerCount = #Players:GetPlayers(),
+        maxPlayers = Players.MaxPlayers,
+    })
+end
+
+local function claimCandidate(jobId, playerCount)
+    if not State.WSConnected then return true, "offline" end
+    local requestId = nextRequestId("claim")
+    State.ClaimReplies[requestId] = nil
+
+    if not wsSend({
+        type = "candidate_claim",
+        requestId = requestId,
+        player = Player.Name,
+        userId = Player.UserId,
+        placeId = game.PlaceId,
+        currentJobId = game.JobId,
+        jobId = jobId,
+        playerCount = playerCount,
+    }) then
+        return true, "send_failed"
+    end
+
+    local deadline = os.clock() + Config.ClaimReplyTimeout
+    while State.Running and os.clock() < deadline do
+        if State.PendingAssignment then return false, "room_assignment" end
+        local reply = State.ClaimReplies[requestId]
+        if reply then
+            State.ClaimReplies[requestId] = nil
+            return reply.granted == true, tostring(reply.reason or "")
+        end
+        task.wait(0.03)
+    end
+    State.ClaimReplies[requestId] = nil
+    return true, "claim_timeout"
+end
+
+local function assignmentFailed(reason)
+    if State.WSConnected and State.TeleportReservationId then
+        wsSend({
+            type = "assignment_failed",
+            reservationId = State.TeleportReservationId,
+            player = Player.Name,
+            userId = Player.UserId,
+            jobId = State.TeleportTarget,
+            reason = tostring(reason or "teleport_failed"),
+        })
+    end
+end
+
+local function handleWebSocketMessage(message)
+    local ok, data = pcall(function() return HttpService:JSONDecode(message) end)
+    if not ok or type(data) ~= "table" then return end
+
+    if data.type == "ping" then
+        wsSend({type = "pong", time = os.time(), player = Player.Name, userId = Player.UserId, jobId = game.JobId})
+        return
+    end
+
+    if data.type == "coordinator_stats" then
+        State.CoordinatorClients = tonumber(data.clients) or 0
+        State.CoordinatorRooms = tonumber(data.rooms) or 0
+        return
+    end
+
+    if data.type == "hello_ack" then
+        State.CoordinatorClients = tonumber(data.clients) or State.CoordinatorClients
+        State.CoordinatorRooms = tonumber(data.rooms) or State.CoordinatorRooms
+        return
+    end
+
+    if data.type == "room_hint" then
+        if not State.InQualifiedRoom and tostring(data.jobId or "") ~= game.JobId then
+            State.RoomHint = true
+        end
+        return
+    end
+
+    if data.type == "room_assignment" then
+        if tonumber(data.placeId) ~= game.PlaceId then return end
+        if State.InQualifiedRoom then return end
+        if type(data.jobId) ~= "string" or data.jobId == "" or data.jobId == game.JobId then return end
+        State.PendingAssignment = data
+        return
+    end
+
+    if data.type == "room_closed" then
+        if tostring(data.jobId or "") == game.JobId and State.InQualifiedRoom then
+            State.ForceLeaveRoom = true
+        end
+        return
+    end
+
+    if data.type == "candidate_claim_result" and type(data.requestId) == "string" then
+        State.ClaimReplies[data.requestId] = data
+        return
+    end
+end
+
+local function bindSocketEvent(socket, eventName, callback)
+    local ok, signal = pcall(function() return socket[eventName] end)
+    if not ok or signal == nil then return false end
+    if typeof(signal) == "RBXScriptSignal" then
+        signal:Connect(callback)
+        return true
+    end
+    if type(signal) == "table" and type(signal.Connect) == "function" then
+        signal:Connect(callback)
+        return true
+    end
+    return false
+end
+
+local function connectWebSocket()
+    if not Config.EnableWebSocket then return false end
+    local connector = getWebSocketConnector()
+    if not connector then
+        State.LastError = "Executor has no WebSocket connector"
+        return false
+    end
+
+    local ok, socket = pcall(connector, Config.WSUrl)
+    if not ok or not socket then return false end
+
+    State.WS = socket
+    State.WSConnected = true
+    if not bindSocketEvent(socket, "OnMessage", handleWebSocketMessage) then
+        bindSocketEvent(socket, "Message", handleWebSocketMessage)
+    end
+
+    local function onClose()
+        if State.WS == socket then
+            State.WS = nil
+            State.WSConnected = false
+        end
+    end
+    if not bindSocketEvent(socket, "OnClose", onClose) then
+        bindSocketEvent(socket, "Closed", onClose)
+    end
+
+    sendHello()
+    return true
+end
+
+task.spawn(function()
+    while State.Running and Config.EnableWebSocket do
+        if not State.WSConnected or not State.WS then
+            State.WS = nil
+            State.WSConnected = false
+            connectWebSocket()
+            task.wait(State.WSConnected and 1 or 3)
+        else
+            local now = os.clock()
+            if now - State.LastClientHeartbeatAt >= Config.ClientHeartbeatInterval then
+                State.LastClientHeartbeatAt = now
+                sendHello()
+                sendClientStatus()
+            end
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- ============================================================================
+-- [10] TELEPORT / SERVER BROWSER
+-- ============================================================================
+TeleportService.TeleportInitFailed:Connect(function(_, result, message, _, options)
+    local failedJob = options and options.ServerInstanceId or State.TeleportTarget
+    State.TeleportFailed = {
+        jobId = failedJob,
+        result = tostring(result),
+        message = tostring(message or ""),
+    }
+    debugPrint("TeleportInitFailed", State.TeleportFailed.result, State.TeleportFailed.message, failedJob)
+end)
+
+local function teleportToJob(jobId, reservationId, source)
+    if type(jobId) ~= "string" or jobId == "" or jobId == game.JobId then return false end
+    State.TeleportTarget = jobId
+    State.TeleportReservationId = reservationId
+    State.TeleportFailed = nil
+    blockJob(jobId, Config.CandidateLocalBlacklistSeconds)
+
+    setStatus("Joining server...", source or "JOINING", "JobId=" .. string.sub(jobId, 1, 12))
+    local ok = pcall(function()
+        ServerBrowser:InvokeServer("teleport", jobId)
+    end)
+    if not ok then
+        assignmentFailed("invoke_failed")
+        State.TeleportTarget = nil
+        State.TeleportReservationId = nil
+        return false
+    end
+
+    local deadline = os.clock() + Config.TeleportWaitSeconds
+    while State.Running and os.clock() < deadline do
+        if State.TeleportFailed then
+            local failure = State.TeleportFailed
+            assignmentFailed(failure.result .. ":" .. failure.message)
+            State.TeleportTarget = nil
+            State.TeleportReservationId = nil
+            State.TeleportFailed = nil
+            return false
+        end
+        task.wait(0.15)
+    end
+
+    -- If still running in the old server, consider it a failed/ignored teleport.
+    assignmentFailed("teleport_timeout")
+    State.TeleportTarget = nil
+    State.TeleportReservationId = nil
+    return false
+end
+
+local function processPendingAssignment()
+    local assignment = State.PendingAssignment
+    if not assignment or State.InQualifiedRoom then return false end
+    State.PendingAssignment = nil
+
+    local jobId = tostring(assignment.jobId or "")
+    if jobId == "" or jobId == game.JobId then return false end
+
+    local playerCount = tonumber(assignment.playerCount) or 0
+    local maxPlayers = tonumber(assignment.maxPlayers) or Players.MaxPlayers
+    if playerCount >= maxPlayers then
+        State.TeleportReservationId = tostring(assignment.reservationId or "")
+        State.TeleportTarget = jobId
+        assignmentFailed("room_reported_full")
+        State.TeleportReservationId = nil
+        State.TeleportTarget = nil
+        return false
+    end
+
+    State.Hopping = true
+    Movement.cancel()
+    local ok = teleportToJob(jobId, tostring(assignment.reservationId or ""), "JOIN_SHARED_ROOM")
+    State.Hopping = false
+    return ok
+end
+
+local Browser = {}
+
+local function shuffled(t)
+    local copy = {}
+    for i, v in ipairs(t) do copy[i] = v end
+    for i = #copy, 2, -1 do
+        local j = math.random(1, i)
+        copy[i], copy[j] = copy[j], copy[i]
+    end
+    return copy
+end
+
+function Browser.scan()
+    local now = os.clock()
+    if State.BrowserCache and now - State.BrowserCacheAt < Config.BrowserCacheSeconds then
+        return shuffled(State.BrowserCache)
+    end
+
+    setStatus("Scanning 100-page Server Browser...", "SCANNING", string.format("target players=%d-%d", Config.PreferredPlayersMin, Config.PreferredPlayersMax))
+    local found = {}
+    local seen = {}
+    local startOffset = (Player.UserId % Config.BrowserMaxPages)
+
+    for step = 1, Config.BrowserMaxPages do
+        if not State.Running or State.PendingAssignment or State.RoomHint then break end
+        local page = ((startOffset + step - 1) % Config.BrowserMaxPages) + 1
+        local ok, data = pcall(function() return ServerBrowser:InvokeServer(page) end)
+        if ok and type(data) == "table" then
+            for jobId, info in pairs(data) do
+                local count = type(info) == "table" and tonumber(info.Count) or nil
+                if type(jobId) == "string"
+                    and not seen[jobId]
+                    and count
+                    and count >= Config.PreferredPlayersMin
+                    and count <= Config.PreferredPlayersMax
+                    and not jobBlocked(jobId)
+                then
+                    seen[jobId] = true
+                    found[#found + 1] = {
+                        jobId = jobId,
+                        players = count,
+                        region = info.Region,
+                        lastUpdate = info.__LastUpdate,
+                    }
+                end
+            end
+        end
+        if step % 10 == 0 then
+            setStatus("Scanning Server Browser...", "SCANNING", string.format("page %d/%d | candidates=%d", step, Config.BrowserMaxPages, #found))
+        end
+        task.wait(Config.BrowserPageDelay)
+    end
+
+    State.BrowserCacheAt = now
+    State.BrowserCache = found
+    return shuffled(found)
+end
+
+function Browser.hopCandidate()
+    if State.Hopping then return false end
+    State.Hopping = true
+    Movement.cancel()
+
+    -- Short per-account stagger: all 20 tabs remain scouts, but they do not hit page 1 simultaneously.
+    local stagger = (Player.UserId % 20) * 0.035
+    if stagger > 0 then task.wait(stagger) end
+
+    local candidates = Browser.scan()
+    for _, candidate in ipairs(candidates) do
+        if not State.Running then break end
+        if State.PendingAssignment or State.RoomHint then
+            State.Hopping = false
+            return false
+        end
+        if not jobBlocked(candidate.jobId) then
+            local granted, reason = claimCandidate(candidate.jobId, candidate.players)
+            if reason == "room_assignment" then
+                State.Hopping = false
+                return false
+            end
+            if reason == "room" then
+                State.RoomHint = true
+                requestSharedRoom(true)
+                State.Hopping = false
+                return false
+            elseif not granted and reason == "bad" then
+                blockJob(candidate.jobId, 60)
+            elseif not granted and reason == "claimed" then
+                blockJob(candidate.jobId, 12)
+            end
+            if granted then
+                setStatus(
+                    "Testing medium server...",
+                    "HOP_CANDIDATE",
+                    string.format("players=%d | %s", candidate.players, string.sub(candidate.jobId, 1, 12))
+                )
+                local ok = teleportToJob(candidate.jobId, nil, "HOP_CANDIDATE")
+                if ok then
+                    State.Hopping = false
+                    return true
+                end
+            end
+        end
+    end
+
+    State.BrowserCache = nil
+    State.Hopping = false
+    setStatus("No usable 5-6 player candidate; rescanning...", "SCOUT")
+    task.wait(1)
+    return false
+end
+
+-- ============================================================================
+-- [11] ANTI-IDLE / CLEANUP
+-- ============================================================================
+Player.Idled:Connect(function()
+    pcall(function()
+        VirtualUser:Button2Down(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+        task.wait(0.5)
+        VirtualUser:Button2Up(Vector2.new(0, 0), workspace.CurrentCamera.CFrame)
+    end)
+end)
+
+-- ============================================================================
+-- [12] MAIN STATE MACHINE
+-- ============================================================================
+local function waitForCharacter()
+    while State.Running do
+        if State.Character and State.Root and State.Humanoid and State.Humanoid.Health > 0 then return true end
+        setStatus("Waiting character...", "CHARACTER")
+        task.wait(0.5)
+    end
+    return false
+end
+
+local function handleQualifiedRoom(progress)
+    if not State.InQualifiedRoom then
+        State.InQualifiedRoom = true
+        State.QualifiedSince = os.clock()
+        State.LastBadReportJob = nil
+        debugPrint("Qualified room", game.JobId, progress and progress.remaining)
+    end
+
+    if os.clock() - State.LastRoomHeartbeatAt >= Config.RoomHeartbeatInterval then
+        State.LastRoomHeartbeatAt = os.clock()
+        publishRoom(progress)
+    end
+
+    local active = activeCakePrince()
+    local stored = storedCakePrince()
+    if active or stored then
+        killCakePrinceStep()
+        return
+    end
+
+    if progress and progress.known and progress.ready then
+        spawnCakePrinceStep()
+        return
+    end
+
+    if progress and progress.known and progress.remaining and progress.remaining <= Config.QualifiedRemaining then
+        farmCakeMobStep(progress)
+        return
+    end
+
+    setStatus("Qualified room - refreshing state...", "ROOM_SYNC")
+end
+
+local function leaveQualifiedRoom(reason)
+    Movement.cancel()
+    closeRoom(reason)
+    State.InQualifiedRoom = false
+    State.QualifiedSince = nil
+    State.BossWasSeen = false
+    State.ForceLeaveRoom = false
+    State.BrowserCache = nil
+    setStatus("Cake cycle ended - scouting again", "SCOUT", tostring(reason or "cycle_reset"))
+    task.wait(0.4)
+end
+
+local function scoutStep(progress)
+    State.InQualifiedRoom = false
+    Movement.cancel()
+
+    if progress and progress.known and progress.remaining and progress.remaining > Config.QualifiedRemaining then
+        reportCurrentBad(progress, "remaining_too_high")
+        setStatus(
+            "Server not qualified",
+            "SCOUT",
+            string.format("remaining=%d > %d | looking for shared room", progress.remaining, Config.QualifiedRemaining)
+        )
+    elseif not progress or not progress.known then
+        setStatus("Progress unknown - retrying", "CHECK_PROGRESS")
+    end
+
+    requestSharedRoom(State.RoomHint)
+    local waitUntil = os.clock() + Config.SharedRoomWaitBeforeBrowser
+    while State.Running and os.clock() < waitUntil do
+        if State.PendingAssignment then
+            processPendingAssignment()
+            return
+        end
+        if State.RoomHint then
+            requestSharedRoom(true)
+        end
+        task.wait(0.05)
+    end
+
+    if State.PendingAssignment then
+        processPendingAssignment()
+        return
+    end
+
+    Browser.hopCandidate()
+end
+
+-- Initial boot.
+ensureMarines()
+waitForCharacter()
+
+while State.Running do
+    local ok, err = xpcall(function()
+        if not ensureMarines() then
+            setStatus("Unable to choose Marines; retrying", "TEAM")
+            task.wait(1)
+            return
+        end
+
+        if not waitForCharacter() then return end
+
+        if not isSea3() then
+            setStatus("Traveling to Sea 3...", "TRAVEL_SEA3")
+            pcall(function() COMMF_:InvokeServer("TravelZou") end)
+            task.wait(5)
+            return
+        end
+
+        if State.PendingAssignment and not State.InQualifiedRoom then
+            processPendingAssignment()
+            task.wait(0.1)
+            return
+        end
+
+        local progress = queryProgress(true)
+        local qualified = isQualified(progress)
+
+        if State.ForceLeaveRoom then
+            leaveQualifiedRoom("coordinator_room_closed")
+            return
+        end
+
+        if qualified then
+            handleQualifiedRoom(progress)
+            task.wait(0.10)
+            return
+        end
+
+        if State.InQualifiedRoom then
+            -- Strong evidence of a new 500-kill cycle means Cake Prince died / room cycle reset.
+            if progress and progress.known and progress.remaining and progress.remaining > Config.QualifiedRemaining then
+                leaveQualifiedRoom(State.BossWasSeen and "boss_dead_cycle_reset" or "cycle_reset")
+                return
+            end
+
+            -- Unknown responses get a grace window so a transient remote failure does not blow up a good room.
+            if State.UnknownSince and os.clock() - State.UnknownSince <= Config.ProgressUnknownGrace then
+                setStatus("Qualified room - progress transiently unknown", "ROOM_SYNC")
+                task.wait(0.25)
+                return
+            end
+
+            leaveQualifiedRoom("qualification_lost")
+            return
+        end
+
+        scoutStep(progress)
+    end, function(e)
+        return debug.traceback(tostring(e), 2)
+    end)
+
+    if not ok then
+        State.LastError = tostring(err)
+        setStatus("Recovered from error", "ERROR", string.sub(tostring(err), 1, 180))
+        debugPrint(err)
+        Movement.cancel()
+        task.wait(1)
+    end
+end
+
+Movement.cancel()
+closeRoom("client_stopped")
+pcall(function()
+    if Movement.Proxy then Movement.Proxy:Destroy() end
+end)
