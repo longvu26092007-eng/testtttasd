@@ -1,5 +1,5 @@
 --[[
-    KATAKURI COORDINATOR CLIENT V3
+    KATAKURI COORDINATOR CLIENT V4 - FRAGMENT + RACE
     Standalone Cake Prince farm + 20-tab shared server coordination.
 
     Design goals:
@@ -23,6 +23,60 @@ repeat task.wait(0.25) until game:IsLoaded()
 local ENV = getgenv()
 ENV.KatakuriConfig = ENV.KatakuriConfig or {}
 local UserConfig = ENV.KatakuriConfig
+
+-- ============================================================================
+-- [01A] FRAGMENT TARGET + RACE TARGET
+-- ============================================================================
+-- Cách dùng trước khi load script:
+--   getgenv().fragmenttarget = 10000
+--   getgenv().race = "Human"
+--
+-- Alias race hỗ trợ:
+--   Rabbit/Mink, Shark/Fish/Fishman, Angel/Skypiea,
+--   Human, Ghoul, Cyborg.
+--
+-- nil / "" / "off" ở race = bỏ qua race gate.
+-- Khi Fragment >= fragmenttarget VÀ race đã đúng target:
+--   <PlayerName>.txt = "Completed-fragment"
+--
+-- Race thường tự reroll qua BlackbeardReward khi có >=2500 Fragment.
+-- Ghoul/Cyborg dùng remote riêng giống source Auto Tyrant.
+ENV.fragmenttarget = ENV.fragmenttarget
+ENV.race = ENV.race
+
+local RaceFeature = {
+    Target = nil,
+    Ready = true,
+    DriverRunning = false,
+    Completed = false,
+    LastActionAt = 0,
+    LastLogAt = 0,
+    LastCheckAt = 0,
+    CompletionFile = nil,
+}
+
+local RACE_ALIAS = {
+    rabbit = "Mink",
+    mink = "Mink",
+
+    shark = "Fishman",
+    fish = "Fishman",
+    fishman = "Fishman",
+
+    angel = "Skypiea",
+    skypiea = "Skypiea",
+
+    human = "Human",
+    ghoul = "Ghoul",
+    cyborg = "Cyborg",
+}
+
+local REROLLABLE_RACES = {
+    Mink = true,
+    Fishman = true,
+    Skypiea = true,
+    Human = true,
+}
 
 local Config = {
     -- Team is intentionally fixed by spec.
@@ -118,12 +172,198 @@ local function debugPrint(...)
     end
 end
 
+-- Forward declaration: Fragment/Race helpers below are defined before the
+-- state table is constructed, but they must capture this local State.
+local State
+
+local function currentFragments()
+    local ok, value = pcall(function()
+        local data = Player:FindFirstChild("Data")
+        local fragments = data and data:FindFirstChild("Fragments")
+        return fragments and fragments.Value or nil
+    end)
+    value = ok and tonumber(value) or nil
+    State.CurrentFragments = value or 0
+    return value
+end
+
+local function currentRace()
+    local ok, value = pcall(function()
+        local data = Player:FindFirstChild("Data")
+        local race = data and data:FindFirstChild("Race")
+        return race and tostring(race.Value) or nil
+    end)
+    return ok and value or nil
+end
+
+local function resolveRaceTarget()
+    local raw = ENV.race
+    if raw == nil then
+        RaceFeature.Target = nil
+        RaceFeature.Ready = true
+        State.RaceTarget = nil
+        State.RaceReady = true
+        return nil
+    end
+
+    local key = tostring(raw):lower():gsub("%s+", "")
+    if key == "" or key == "off" or key == "false" then
+        RaceFeature.Target = nil
+        RaceFeature.Ready = true
+        State.RaceTarget = nil
+        State.RaceReady = true
+        return nil
+    end
+
+    local target = RACE_ALIAS[key]
+    if not target then
+        warn("[KATAKURI][Race] race không hợp lệ: " .. tostring(raw) .. " -> bỏ qua race gate")
+        RaceFeature.Target = nil
+        RaceFeature.Ready = true
+        State.RaceTarget = nil
+        State.RaceReady = true
+        return nil
+    end
+
+    RaceFeature.Target = target
+    RaceFeature.Ready = currentRace() == target
+    State.RaceTarget = target
+    State.RaceReady = RaceFeature.Ready
+    return target
+end
+
+local function tryWriteCompletedFragment()
+    if RaceFeature.Completed then return true end
+
+    local targetFragments = tonumber(ENV.fragmenttarget)
+    State.FragmentTarget = targetFragments
+    if not targetFragments or targetFragments <= 0 then
+        return false
+    end
+
+    local fragments = currentFragments()
+    if not fragments or fragments < targetFragments then
+        return false
+    end
+
+    local raceTarget = resolveRaceTarget()
+    local raceNow = currentRace()
+    local raceReady = raceTarget == nil or raceNow == raceTarget
+    RaceFeature.Ready = raceReady
+    State.RaceReady = raceReady
+
+    if not raceReady then
+        return false
+    end
+
+    if type(writefile) ~= "function" then
+        warn("[KATAKURI][Fragment] Executor không hỗ trợ writefile")
+        return false
+    end
+
+    local fileName = tostring(Player.Name) .. ".txt"
+    local ok, err = pcall(function()
+        writefile(fileName, "Completed-fragment")
+    end)
+
+    if not ok then
+        warn("[KATAKURI][Fragment] writefile lỗi: " .. tostring(err))
+        return false
+    end
+
+    RaceFeature.Completed = true
+    RaceFeature.CompletionFile = fileName
+    State.CompletionWritten = true
+
+    ENV.CompletedFragment = true
+    ENV.CompletedFragmentFile = fileName
+    ENV.CompletedFragmentRace = raceNow
+    ENV.CompletedFragmentValue = fragments
+    ENV.CompletedFragmentTarget = targetFragments
+
+    warn(string.format(
+        "[KATAKURI][Fragment] %s = Completed-fragment | Race=%s | Fragment=%d/%d",
+        fileName,
+        tostring(raceNow or "?"),
+        fragments,
+        targetFragments
+    ))
+    return true
+end
+
+local function raceDriverStep()
+    local target = resolveRaceTarget()
+    if not target then
+        return true
+    end
+
+    local raceNow = currentRace()
+    if raceNow == target then
+        RaceFeature.Ready = true
+        State.RaceReady = true
+        return true
+    end
+
+    RaceFeature.Ready = false
+    State.RaceReady = false
+
+    local now = os.clock()
+    if now - RaceFeature.LastActionAt < 3 then
+        return false
+    end
+
+    local fragments = currentFragments() or 0
+
+    if REROLLABLE_RACES[target] then
+        if fragments < 2500 then
+            if now - RaceFeature.LastLogAt >= 5 then
+                RaceFeature.LastLogAt = now
+                debugPrint(
+                    "Race waiting fragments:",
+                    tostring(raceNow),
+                    "->",
+                    target,
+                    fragments .. "/2500"
+                )
+            end
+            return false
+        end
+
+        RaceFeature.LastActionAt = now
+        pcall(function()
+            COMMF_:InvokeServer("BlackbeardReward", "Reroll", "1")
+        end)
+        pcall(function()
+            COMMF_:InvokeServer("BlackbeardReward", "Reroll", "2")
+        end)
+        return false
+    end
+
+    RaceFeature.LastActionAt = now
+
+    if target == "Ghoul" then
+        pcall(function()
+            COMMF_:InvokeServer("Ectoplasm", "BuyCheck", 4)
+        end)
+        task.wait(0.35)
+        pcall(function()
+            COMMF_:InvokeServer("Ectoplasm", "Change", 4)
+        end)
+    elseif target == "Cyborg" then
+        pcall(function()
+            COMMF_:InvokeServer("CyborgTrainer", "Buy")
+        end)
+    end
+
+    return false
+end
+
 -- Stop older execution cleanly if re-executed.
 if type(ENV.__KATAKURI_COORDINATOR_STOP) == "function" then
     pcall(ENV.__KATAKURI_COORDINATOR_STOP)
 end
 
-local State = {
+State = {
     Running = true,
     Phase = "BOOT",
     Status = "Starting...",
@@ -171,11 +411,35 @@ local State = {
     LastBadReportJob = nil,
     LastBadReportAt = 0,
     LastError = "",
+
+    CurrentFragments = 0,
+    FragmentTarget = tonumber(ENV.fragmenttarget),
+    RaceTarget = nil,
+    RaceReady = true,
+    CompletionWritten = false,
 }
 
 ENV.__KATAKURI_COORDINATOR_STOP = function()
     State.Running = false
 end
+
+resolveRaceTarget()
+
+-- Race + Fragment background driver.
+-- Nó chỉ quản lý race/fragment marker, không giành movement/combat của Katakuri.
+task.spawn(function()
+    while State.Running do
+        local ok, err = pcall(function()
+            currentFragments()
+            raceDriverStep()
+            tryWriteCompletedFragment()
+        end)
+        if not ok then
+            debugPrint("Fragment/Race driver error:", err)
+        end
+        task.wait(0.75)
+    end
+end)
 
 local function setStatus(status, phase, extra)
     if phase then State.Phase = phase end
@@ -282,7 +546,7 @@ local function createUI()
     local frame = Instance.new("Frame")
     frame.Name = "Main"
     frame.Position = UDim2.fromOffset(18, 110)
-    frame.Size = UDim2.fromOffset(360, 270)
+    frame.Size = UDim2.fromOffset(360, 320)
     frame.BackgroundColor3 = Color3.fromRGB(16, 17, 21)
     frame.BackgroundTransparency = 0.05
     frame.BorderSizePixel = 0
@@ -326,7 +590,7 @@ local function createUI()
     content.Parent = frame
 
     local labels = {}
-    local names = {"Player", "Team", "State", "Server", "Progress", "Coordinator", "Room", "Status"}
+    local names = {"Player", "Team", "State", "Server", "Progress", "Fragment", "Race", "Coordinator", "Room", "Status"}
     for i, name in ipairs(names) do
         local l = Instance.new("TextLabel")
         l.Name = name
@@ -357,7 +621,7 @@ local function createUI()
     minimize.MouseButton1Click:Connect(function()
         minimized = not minimized
         content.Visible = not minimized
-        frame.Size = minimized and UDim2.fromOffset(360, 42) or UDim2.fromOffset(360, 270)
+        frame.Size = minimized and UDim2.fromOffset(360, 42) or UDim2.fromOffset(360, 320)
         minimize.Text = minimized and "+" or "—"
     end)
 
@@ -384,6 +648,19 @@ task.spawn(function()
             labels.State.Text = "State: " .. State.Phase
             labels.Server.Text = string.format("Server: %d/%d | %s", #Players:GetPlayers(), Players.MaxPlayers, string.sub(game.JobId, 1, 10))
             labels.Progress.Text = string.format("Progress: remaining=%s | killed=%s/%d", remainingText, killedText, Config.TotalRequired)
+
+            local fragNow = currentFragments() or 0
+            local fragTarget = tonumber(ENV.fragmenttarget)
+            labels.Fragment.Text = fragTarget and fragTarget > 0
+                and string.format("Fragment: %d/%d%s", fragNow, fragTarget, State.CompletionWritten and " | COMPLETED" or "")
+                or string.format("Fragment: %d | target=OFF", fragNow)
+
+            local raceNow = currentRace() or "?"
+            local raceTarget = State.RaceTarget
+            labels.Race.Text = raceTarget
+                and string.format("Race: %s -> %s | %s", raceNow, raceTarget, State.RaceReady and "READY" or "CHANGING")
+                or string.format("Race: %s | target=OFF", raceNow)
+
             labels.Coordinator.Text = string.format(
                 "WS: %s | clients=%d | rooms=%d",
                 State.WSReady and "READY" or (State.WSConnected and "CONNECTING" or "OFF"),
