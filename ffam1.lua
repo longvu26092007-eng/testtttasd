@@ -1,5 +1,5 @@
 --[[
-    KATAKURI COORDINATOR CLIENT V5 - ROOM FIRST
+    KATAKURI COORDINATOR CLIENT V5.2 - WS FIX
     Standalone Cake Prince farm + 20-tab shared server coordination.
 
     Design goals:
@@ -71,6 +71,7 @@ local REROLLABLE_RACES = {
 
 local Config = {
     Team = "Marines",
+    EnableWebSocket = true,
 
     -- Cake Prince.
     TotalRequired = 500,
@@ -87,10 +88,10 @@ local Config = {
 
     -- Shared room joining.
     WSUrl = "ws://127.0.0.1:9877",
-    RoomRequestInterval = 0.08,
+    RoomRequestInterval = 0.15,
     RoomReplyTimeout = 0.35,
-    RoomHeartbeatInterval = 0.65,
-    ClientHeartbeatInterval = 1.5,
+    RoomHeartbeatInterval = 1.0,
+    ClientHeartbeatInterval = 2.5,
     WSAckTimeout = 3.0,
     WSStaleSeconds = 20,
     ClaimReplyTimeout = 0.25,
@@ -383,6 +384,8 @@ State = {
     RoomRequestNoRoom = false,
     RoomRequestResolvedAt = 0,
     SharedJoinFailures = 0,
+    LastAssignmentReservationId = nil,
+    LastAssignmentSeenAt = 0,
     ForceLeaveRoom = false,
     ClaimReplies = {},
     RequestCounter = 0,
@@ -1411,7 +1414,7 @@ end
 local function clientMeta(messageType)
     return {
         type = messageType,
-        version = 5,
+        version = 52,
         player = Player.Name,
         userId = Player.UserId,
         placeId = game.PlaceId,
@@ -1600,8 +1603,23 @@ local function handleWebSocketMessage(message)
         if tonumber(data.placeId) ~= game.PlaceId then return end
         if State.InQualifiedRoom then return end
         if type(data.jobId) ~= "string" or data.jobId == "" or data.jobId == game.JobId then return end
+
+        local reservationId = tostring(data.reservationId or "")
+        local now = os.clock()
+
+        -- V5.1: proactive push + request_room may both deliver the same assignment.
+        -- Keep only one copy of the SAME reservation.
+        if reservationId ~= ""
+            and State.LastAssignmentReservationId == reservationId
+            and now - State.LastAssignmentSeenAt < 5
+        then
+            return
+        end
+
+        State.LastAssignmentReservationId = reservationId ~= "" and reservationId or nil
+        State.LastAssignmentSeenAt = now
         State.RoomRequestNoRoom = false
-        State.RoomRequestResolvedAt = os.clock()
+        State.RoomRequestResolvedAt = now
         State.PendingAssignment = data
         return
     end
@@ -1650,7 +1668,10 @@ local function connectWebSocket()
     end
 
     local ok, socket = pcall(connector, Config.WSUrl)
-    if not ok or not socket then return false end
+    if not ok or not socket then
+        State.LastError = "WebSocket connect failed: " .. tostring(socket)
+        return false
+    end
 
     State.WS = socket
     State.WSConnected = true
