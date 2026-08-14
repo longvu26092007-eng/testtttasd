@@ -1,5 +1,5 @@
 --[[
-    KATAKURI COORDINATOR CLIENT V5.3 - CHARACTER FIX
+    KATAKURI COORDINATOR CLIENT V5.5 - BATCH20 HOP
     Standalone Cake Prince farm + 20-tab shared server coordination.
 
     Design goals:
@@ -81,9 +81,6 @@ local Config = {
 
     -- Server Browser: fixed rules.
     BrowserMaxPages = 100,
-    BrowserBatchSize = 20,
-    BrowserBatchTimeout = 0.75,
-    BrowserCacheSeconds = 1.0,
     CandidateLocalBlacklistSeconds = 90,
 
     -- Shared room joining.
@@ -1517,7 +1514,7 @@ end
 local function clientMeta(messageType)
     return {
         type = messageType,
-        version = 53,
+        version = 55,
         player = Player.Name,
         userId = Player.UserId,
         placeId = game.PlaceId,
@@ -1964,187 +1961,110 @@ end
 
 local Browser = {}
 
-local function candidateTieScore(jobId)
-    -- Stable per-account permutation inside the same player-count group.
-    -- This keeps priority 4 -> 5 -> 6 while spreading 20 tabs across JobIds.
-    local h = Player.UserId % 2147483647
-    for i = 1, #jobId do
-        h = (h * 33 + string.byte(jobId, i)) % 2147483647
-    end
-    return h
+-- ============================================================================
+-- SERVER BROWSER V5.5
+-- ============================================================================
+-- 20 page / batch, nhưng KHÔNG spam 20 InvokeServer cùng lúc.
+--
+-- Mỗi batch:
+--   Worker 1: page 01 -> 05
+--   Worker 2: page 06 -> 10
+--   Worker 3: page 11 -> 15
+--   Worker 4: page 16 -> 20
+--
+-- Mỗi worker gọi InvokeServer TUẦN TỰ.
+-- Tổng cộng chỉ tối đa 4 InvokeServer đang chạy cùng lúc.
+--
+-- Sau mỗi batch 20 page:
+--   priority 4 players -> 5 players -> 6 players
+--
+-- Nếu toàn bộ candidate trong batch bị claim/bad/fail:
+--   tiếp tục batch 21-40 -> 41-60 -> 61-80 -> 81-100.
+--
+-- Shared room xuất hiện ở bất kỳ lúc nào:
+--   bỏ Server Browser ngay, quay về ROOM FIRST.
+
+local BROWSER_BATCH_PAGES = 20
+local BROWSER_WORKERS = 4
+local PAGES_PER_WORKER = 5
+local BROWSER_BATCH_MAX_WAIT = 3.0
+
+local function browserJobBlocked(jobId)
+    return jobBlocked(jobId)
 end
 
-local function sortCandidates(candidates)
-    table.sort(candidates, function(a, b)
-        if a.players ~= b.players then
-            return a.players < b.players -- 4 first, then 5, then 6.
-        end
-        if a.tie ~= b.tie then
-            return a.tie < b.tie
-        end
-        return a.jobId < b.jobId
-    end)
-    return candidates
+local function makeCandidate(jobId, info)
+    if type(jobId) ~= "string" or jobId == "" or jobId == game.JobId then
+        return nil
+    end
+
+    if browserJobBlocked(jobId) then
+        return nil
+    end
+
+    local count = type(info) == "table" and tonumber(info.Count) or nil
+    if count ~= 4 and count ~= 5 and count ~= 6 then
+        return nil
+    end
+
+    return {
+        jobId = jobId,
+        players = count,
+        region = info.Region,
+        lastUpdate = info.__LastUpdate,
+    }
 end
 
-function Browser.scan()
-    local now = os.clock()
-    if State.BrowserCache and now - State.BrowserCacheAt < Config.BrowserCacheSeconds then
-        return sortCandidates(State.BrowserCache)
+local function shuffleForAccount(list)
+    -- Chỉ đảo thứ tự JobId TRONG CÙNG player-count.
+    -- Priority 4 > 5 > 6 không bao giờ thay đổi.
+    local seed = (Player.UserId % 2147483647) + #list * 97
+
+    for i = #list, 2, -1 do
+        seed = (seed * 1103515245 + 12345) % 2147483647
+        local j = (seed % i) + 1
+        list[i], list[j] = list[j], list[i]
     end
-
-    setStatus(
-        "Scanning 100 pages...",
-        "SCANNING",
-        "ONLY 4/5/6 players | priority 4 > 5 > 6"
-    )
-
-    local found = {}
-    local seen = {}
-    local startOffset = Player.UserId % Config.BrowserMaxPages
-    local scanned = 0
-    local count4 = 0
-    local count5 = 0
-    local count6 = 0
-
-    local function processPageData(data)
-        if type(data) ~= "table" then return end
-        for jobId, info in pairs(data) do
-            local count = type(info) == "table" and tonumber(info.Count) or nil
-            if type(jobId) == "string"
-                and not seen[jobId]
-                and count
-                and ALLOWED_BROWSER_PLAYERS[count] == true
-                and not jobBlocked(jobId)
-            then
-                seen[jobId] = true
-                if count == 4 then count4 += 1
-                elseif count == 5 then count5 += 1
-                elseif count == 6 then count6 += 1
-                end
-
-                found[#found + 1] = {
-                    jobId = jobId,
-                    players = count,
-                    region = info.Region,
-                    lastUpdate = info.__LastUpdate,
-                    tie = candidateTieScore(jobId),
-                }
-            end
-        end
-    end
-
-    -- Up to 20 ServerBrowser pages are requested concurrently.
-    -- We still have a HARD 100-page ceiling.
-    -- A shared room immediately interrupts this scan.
-    -- Early exit is allowed only when we already found several BEST (4-player)
-    -- candidates; otherwise keep scanning so 4-player servers are not missed.
-    for batchStart = 1, Config.BrowserMaxPages, Config.BrowserBatchSize do
-        if not State.Running or State.PendingAssignment or State.RoomHint then break end
-
-        local batchEnd = math.min(Config.BrowserMaxPages, batchStart + Config.BrowserBatchSize - 1)
-        local results = {}
-        local pending = 0
-
-        for step = batchStart, batchEnd do
-            pending += 1
-            local capturedStep = step
-            local page = ((startOffset + capturedStep - 1) % Config.BrowserMaxPages) + 1
-
-            task.spawn(function()
-                local ok, data = pcall(function()
-                    return ServerBrowser:InvokeServer(page)
-                end)
-                results[capturedStep] = ok and data or false
-                pending -= 1
-            end)
-        end
-
-        local deadline = os.clock() + Config.BrowserBatchTimeout
-        while State.Running
-            and pending > 0
-            and os.clock() < deadline
-            and not State.PendingAssignment
-            and not State.RoomHint
-        do
-            task.wait()
-        end
-
-        if State.PendingAssignment or State.RoomHint then break end
-
-        for step = batchStart, batchEnd do
-            scanned += 1
-            processPageData(results[step])
-        end
-
-        setStatus(
-            "Scanning 100 pages...",
-            "SCANNING",
-            string.format(
-                "pages=%d/100 | 4p=%d | 5p=%d | 6p=%d",
-                scanned, count4, count5, count6
-            )
-        )
-
-        -- Enough perfect 4-player targets: hop now instead of wasting more time.
-        if count4 >= 6 then
-            break
-        end
-
-        task.wait()
-    end
-
-    sortCandidates(found)
-    State.BrowserCacheAt = os.clock()
-    State.BrowserCache = found
-    return found
 end
 
-function Browser.hopCandidate()
-    if State.Hopping then return false end
-    State.Hopping = true
-    Movement.cancel()
+local function tryCandidateList(list)
+    shuffleForAccount(list)
 
-    -- Small de-correlation across 20 tabs.
-    local stagger = (Player.UserId % 20) * 0.02
-    if stagger > 0 then task.wait(stagger) end
+    for _, candidate in ipairs(list) do
+        if not State.Running then
+            return false, "stopped"
+        end
 
-    local candidates = Browser.scan()
-
-    for _, candidate in ipairs(candidates) do
-        if not State.Running then break end
-
-        -- ROOM FIRST: stop browser immediately if any shared room appears.
         if State.PendingAssignment or State.RoomHint then
-            State.Hopping = false
-            return false
+            return false, "room"
         end
 
-        if not jobBlocked(candidate.jobId) then
+        if not browserJobBlocked(candidate.jobId) then
             local granted, reason = claimCandidate(candidate.jobId, candidate.players)
 
             if reason == "room_assignment" then
-                State.Hopping = false
-                return false
+                return false, "room_assignment"
             end
 
             if reason == "room" then
                 State.RoomHint = true
                 requestSharedRoom(true)
-                State.Hopping = false
-                return false
-            elseif not granted and reason == "bad" then
-                blockJob(candidate.jobId, 45)
-            elseif not granted and reason == "claimed" then
-                blockJob(candidate.jobId, 8)
+                return false, "room"
             end
 
-            if granted then
+            if not granted and reason == "bad" then
+                blockJob(candidate.jobId, 45)
+
+            elseif not granted and reason == "claimed" then
+                -- Tab khác đang test JobId này -> bỏ ngắn rồi chọn JobId tiếp theo.
+                blockJob(candidate.jobId, 6)
+
+            elseif granted then
                 setStatus(
                     "Hopping candidate...",
                     "HOP_CANDIDATE",
                     string.format(
-                        "priority=%dp | %s",
+                        "%dp | %s",
                         candidate.players,
                         string.sub(candidate.jobId, 1, 12)
                     )
@@ -2152,18 +2072,207 @@ function Browser.hopCandidate()
 
                 local ok = teleportToJob(candidate.jobId, nil, "HOP_CANDIDATE")
                 if ok then
-                    State.Hopping = false
-                    return true
+                    return true, "teleport"
                 end
             end
         end
     end
 
-    State.BrowserCache = nil
+    return false, "none"
+end
+
+local function fetch20PageBatch(batchStart, rawTotals, usableTotals)
+    local batchEnd = math.min(
+        Config.BrowserMaxPages,
+        batchStart + BROWSER_BATCH_PAGES - 1
+    )
+
+    local batch = {
+        [4] = {},
+        [5] = {},
+        [6] = {},
+    }
+
+    local pendingWorkers = 0
+    local batchOpen = true
+
+    for worker = 1, BROWSER_WORKERS do
+        local workerStart = batchStart + ((worker - 1) * PAGES_PER_WORKER)
+        local workerEnd = math.min(workerStart + PAGES_PER_WORKER - 1, batchEnd)
+
+        if workerStart <= batchEnd then
+            pendingWorkers += 1
+
+            task.spawn(function()
+                for page = workerStart, workerEnd do
+                    if not State.Running
+                        or not batchOpen
+                        or State.PendingAssignment
+                        or State.RoomHint
+                    then
+                        break
+                    end
+
+                    -- Một worker chỉ có đúng 1 InvokeServer đang chạy.
+                    local ok, data = pcall(function()
+                        return ServerBrowser:InvokeServer(page)
+                    end)
+
+                    if batchOpen and ok and type(data) == "table" then
+                        for jobId, info in pairs(data) do
+                            local count = type(info) == "table" and tonumber(info.Count) or nil
+
+                            if count == 4 or count == 5 or count == 6 then
+                                rawTotals[count] += 1
+
+                                local candidate = makeCandidate(jobId, info)
+                                if candidate then
+                                    batch[count][#batch[count] + 1] = candidate
+                                    usableTotals[count] += 1
+                                end
+                            end
+                        end
+                    end
+
+                    -- Yield một nhịp giữa page của cùng worker.
+                    task.wait()
+                end
+
+                pendingWorkers -= 1
+            end)
+        end
+    end
+
+    local deadline = os.clock() + BROWSER_BATCH_MAX_WAIT
+
+    while State.Running
+        and pendingWorkers > 0
+        and os.clock() < deadline
+        and not State.PendingAssignment
+        and not State.RoomHint
+    do
+        task.wait(0.02)
+    end
+
+    -- Worker nào trả quá chậm sau deadline sẽ không được ghi thêm vào batch này.
+    batchOpen = false
+
+    return batch, batchEnd, pendingWorkers
+end
+
+function Browser.scanAndHop()
+    if State.Hopping then
+        return false
+    end
+
+    State.Hopping = true
+    Movement.cancel()
+
+    local raw = {
+        [4] = 0,
+        [5] = 0,
+        [6] = 0,
+    }
+
+    local usable = {
+        [4] = 0,
+        [5] = 0,
+        [6] = 0,
+    }
+
+    for batchStart = 1, Config.BrowserMaxPages, BROWSER_BATCH_PAGES do
+        if not State.Running then
+            break
+        end
+
+        if State.PendingAssignment or State.RoomHint then
+            State.Hopping = false
+            return false
+        end
+
+        local batchEnd = math.min(
+            Config.BrowserMaxPages,
+            batchStart + BROWSER_BATCH_PAGES - 1
+        )
+
+        setStatus(
+            "Scanning Server Browser...",
+            "SCANNING",
+            string.format(
+                "batch=%d-%d/100 | 4p=%d | 5p=%d | 6p=%d",
+                batchStart,
+                batchEnd,
+                usable[4],
+                usable[5],
+                usable[6]
+            )
+        )
+
+        local batch, finishedPage, pending = fetch20PageBatch(
+            batchStart,
+            raw,
+            usable
+        )
+
+        if State.PendingAssignment or State.RoomHint then
+            State.Hopping = false
+            return false
+        end
+
+        setStatus(
+            "Scanning Server Browser...",
+            "SCANNING",
+            string.format(
+                "done=%d/100 | 4p=%d | 5p=%d | 6p=%d%s",
+                finishedPage,
+                usable[4],
+                usable[5],
+                usable[6],
+                pending > 0 and " | slow-page skipped" or ""
+            )
+        )
+
+        -- MỖI batch đều thử ngay theo priority tuyệt đối.
+        for _, playersCount in ipairs({4, 5, 6}) do
+            if #batch[playersCount] > 0 then
+                local hopped, reason = tryCandidateList(batch[playersCount])
+
+                if hopped then
+                    State.Hopping = false
+                    return true
+                end
+
+                if reason == "room" or reason == "room_assignment" then
+                    State.Hopping = false
+                    return false
+                end
+            end
+        end
+
+        -- Batch này có candidate nhưng tất cả đã bị claim/bad/fail:
+        -- chuyển thẳng sang 20 page tiếp theo.
+        task.wait(0.03)
+    end
+
     State.Hopping = false
-    setStatus("No usable 4/5/6 candidate - rescanning", "SCOUT")
+
+    setStatus(
+        "No usable 4/5/6 server - rescanning",
+        "SCOUT",
+        string.format(
+            "RAW 4p=%d | 5p=%d | 6p=%d",
+            raw[4],
+            raw[5],
+            raw[6]
+        )
+    )
+
     task.wait(0.25)
     return false
+end
+
+function Browser.hopCandidate()
+    return Browser.scanAndHop()
 end
 
 -- ============================================================================
