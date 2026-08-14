@@ -1,5 +1,5 @@
 --[[
-    KATAKURI COORDINATOR CLIENT V5.2 - WS FIX
+    KATAKURI COORDINATOR CLIENT V5.3 - CHARACTER FIX
     Standalone Cake Prince farm + 20-tab shared server coordination.
 
     Design goals:
@@ -440,16 +440,119 @@ end
 -- ============================================================================
 -- [03] CHARACTER / TEAM
 -- ============================================================================
-local function bindCharacter(character)
+-- V5.3: non-blocking character binder.
+--
+-- Lỗi cũ:
+-- bindCharacter(oldCharacter) có thể đang WaitForChild(HRP, 10).
+-- Trong lúc đó character mới spawn và bind đúng. Sau 10 giây callback của
+-- oldCharacter quay lại với Root=nil rồi GHI ĐÈ State.Root của character mới.
+-- Kết quả: "Waiting character..." vô hạn cho đến lần respawn tiếp theo.
+--
+-- Fix:
+-- - Không WaitForChild trong CharacterAdded callback.
+-- - Dùng generation token để callback cũ KHÔNG thể ghi đè character mới.
+-- - waitForCharacter tự refresh Player.Character liên tục.
+-- - CharacterRemoving xóa state đúng character.
+local CharacterGeneration = 0
+local LastCharacterRecoveryAt = 0
+
+local function clearCharacterState(character)
+    if character == nil or State.Character == character then
+        State.Character = nil
+        State.Humanoid = nil
+        State.Root = nil
+    end
+end
+
+local function bindCharacterImmediate(character)
+    CharacterGeneration += 1
+    local generation = CharacterGeneration
+
     State.Character = character
-    State.Humanoid = character:WaitForChild("Humanoid", 10)
-    State.Root = character:WaitForChild("HumanoidRootPart", 10)
+    State.Humanoid = character and character:FindFirstChildOfClass("Humanoid") or nil
+    State.Root = character and character:FindFirstChild("HumanoidRootPart") or nil
+
+    if not character then
+        return
+    end
+
+    -- Retry nhẹ trong background. Generation token bảo đảm character cũ
+    -- không bao giờ ghi đè reference của character mới.
+    task.spawn(function()
+        local started = os.clock()
+
+        while State.Running
+            and generation == CharacterGeneration
+            and Player.Character == character
+            and os.clock() - started < 20
+        do
+            local hum = character:FindFirstChildOfClass("Humanoid")
+            local root = character:FindFirstChild("HumanoidRootPart")
+
+            if hum and root then
+                if generation == CharacterGeneration and Player.Character == character then
+                    State.Character = character
+                    State.Humanoid = hum
+                    State.Root = root
+                end
+                return
+            end
+
+            task.wait(0.1)
+        end
+    end)
+end
+
+local function refreshCharacterState()
+    local character = Player.Character
+
+    if not character then
+        if State.Character ~= nil then
+            CharacterGeneration += 1
+            clearCharacterState()
+        end
+        return false, "no_character"
+    end
+
+    if State.Character ~= character then
+        bindCharacterImmediate(character)
+    else
+        -- Repair references without waiting for another CharacterAdded.
+        local hum = character:FindFirstChildOfClass("Humanoid")
+        local root = character:FindFirstChild("HumanoidRootPart")
+
+        if State.Humanoid ~= hum then State.Humanoid = hum end
+        if State.Root ~= root then State.Root = root end
+    end
+
+    local hum = State.Humanoid
+    local root = State.Root
+
+    if not character.Parent then return false, "character_not_parented" end
+    if not hum then return false, "missing_humanoid" end
+    if not root then return false, "missing_hrp" end
+    if hum.Parent ~= character then return false, "stale_humanoid" end
+    if root.Parent ~= character then return false, "stale_hrp" end
+    if hum.Health <= 0 then return false, "dead" end
+
+    return true, "ready"
 end
 
 if Player.Character then
-    task.spawn(bindCharacter, Player.Character)
+    bindCharacterImmediate(Player.Character)
 end
-Player.CharacterAdded:Connect(bindCharacter)
+
+Player.CharacterAdded:Connect(function(character)
+    bindCharacterImmediate(character)
+end)
+
+Player.CharacterRemoving:Connect(function(character)
+    if State.Character == character then
+        CharacterGeneration += 1
+        clearCharacterState(character)
+        Movement.cancel()
+    end
+end)
 
 local function currentTeamName()
     return Player.Team and tostring(Player.Team.Name) or "NONE"
@@ -1414,7 +1517,7 @@ end
 local function clientMeta(messageType)
     return {
         type = messageType,
-        version = 52,
+        version = 53,
         player = Player.Name,
         userId = Player.UserId,
         placeId = game.PlaceId,
@@ -2078,11 +2181,76 @@ end)
 -- [12] MAIN STATE MACHINE
 -- ============================================================================
 local function waitForCharacter()
+    local started = os.clock()
+    local lastReason = "starting"
+    local recoveryStage = 0
+
     while State.Running do
-        if State.Character and State.Root and State.Humanoid and State.Humanoid.Health > 0 then return true end
-        setStatus("Waiting character...", "CHARACTER")
-        task.wait(0.5)
+        local ready, reason = refreshCharacterState()
+
+        if ready then
+            return true
+        end
+
+        lastReason = reason or lastReason
+        local waited = os.clock() - started
+
+        setStatus(
+            "Waiting character...",
+            "CHARACTER",
+            string.format("%.1fs | %s", waited, tostring(lastReason))
+        )
+
+        -- Nếu team đã chọn nhưng Player.Character chưa xuất hiện, nhắc server
+        -- SetTeam lại theo nhịp thưa. Không spam remote.
+        if waited >= 6
+            and (reason == "no_character" or reason == "character_not_parented")
+            and os.clock() - LastCharacterRecoveryAt >= 4
+        then
+            LastCharacterRecoveryAt = os.clock()
+            pcall(function()
+                COMMF_:InvokeServer("SetTeam", Config.Team)
+            end)
+        end
+
+        -- Character model bị lỗi/incomplete quá lâu: ép respawn mềm.
+        -- Chỉ chạy 1 lần cho mỗi lần wait, tránh death loop.
+        if waited >= 12
+            and recoveryStage < 1
+            and State.Character
+            and Player.Character == State.Character
+            and (reason == "missing_hrp"
+                or reason == "missing_humanoid"
+                or reason == "stale_hrp"
+                or reason == "stale_humanoid")
+        then
+            recoveryStage = 1
+
+            local brokenCharacter = State.Character
+            pcall(function()
+                local hum = brokenCharacter:FindFirstChildOfClass("Humanoid")
+                if hum then
+                    hum.Health = 0
+                else
+                    brokenCharacter:BreakJoints()
+                end
+            end)
+
+            CharacterGeneration += 1
+            clearCharacterState(brokenCharacter)
+
+            setStatus(
+                "Recovering broken character...",
+                "CHARACTER_RECOVERY",
+                tostring(reason)
+            )
+        end
+
+        -- Không dùng WaitForChild 10s nữa; polling nhanh để bắt HRP/Humanoid
+        -- ngay khi Roblox tạo chúng.
+        task.wait(0.15)
     end
+
     return false
 end
 
