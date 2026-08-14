@@ -1,15 +1,16 @@
 --[[
-    KATAKURI COORDINATOR CLIENT V4 - FRAGMENT + RACE
+    KATAKURI COORDINATOR CLIENT V5 - ROOM FIRST
     Standalone Cake Prince farm + 20-tab shared server coordination.
 
     Design goals:
       - Team is always Marines.
       - No quest taking.
       - Cake Prince only (no Dough King).
-      - Qualified server = CakePrinceSpawner remaining <= 100, spawn-ready, or Cake Prince exists.
-      - All clients scout. Shared qualified rooms are filled until Roblox reports full.
-      - Server Browser only, max 100 pages, candidate servers target 5-6 players.
-      - Local WebSocket coordinator shares rooms, reservations, candidate claims and bad-server TTLs.
+      - Qualified server = remaining <= 150, spawn-ready, BigMirror ready, or Cake Prince exists.
+      - ROOM FIRST: shared rooms always beat Server Browser.
+      - Each client retries each shared room at most 2 times before moving to the next room.
+      - Server Browser max 100 pages; ONLY 4/5/6-player servers, priority 4 -> 5 -> 6.
+      - All 20 tabs scout, but candidate claims stop duplicate scouting.
       - One state machine owns movement/combat/hop decisions.
 ]]
 
@@ -18,29 +19,28 @@ repeat task.wait(0.25) until game:IsLoaded()
     and game:GetService("ReplicatedStorage"):FindFirstChild("Remotes")
 
 -- ============================================================================
--- [01] CONFIG
+-- [01] FIXED CONFIG
 -- ============================================================================
+-- Core Katakuri behavior is intentionally hard-coded so 20 tabs all run the
+-- same coordination rules. The only external knobs left are:
+--   getgenv().fragmenttarget
+--   getgenv().race
 local ENV = getgenv()
-ENV.KatakuriConfig = ENV.KatakuriConfig or {}
-local UserConfig = ENV.KatakuriConfig
 
 -- ============================================================================
 -- [01A] FRAGMENT TARGET + RACE TARGET
 -- ============================================================================
--- Cách dùng trước khi load script:
+-- Example:
 --   getgenv().fragmenttarget = 10000
 --   getgenv().race = "Human"
 --
--- Alias race hỗ trợ:
+-- Alias:
 --   Rabbit/Mink, Shark/Fish/Fishman, Angel/Skypiea,
 --   Human, Ghoul, Cyborg.
 --
--- nil / "" / "off" ở race = bỏ qua race gate.
--- Khi Fragment >= fragmenttarget VÀ race đã đúng target:
+-- nil / "" / "off" = skip race gate.
+-- When Fragment >= fragmenttarget AND race is correct:
 --   <PlayerName>.txt = "Completed-fragment"
---
--- Race thường tự reroll qua BlackbeardReward khi có >=2500 Fragment.
--- Ghoul/Cyborg dùng remote riêng giống source Auto Tyrant.
 ENV.fragmenttarget = ENV.fragmenttarget
 ENV.race = ENV.race
 
@@ -56,19 +56,10 @@ local RaceFeature = {
 }
 
 local RACE_ALIAS = {
-    rabbit = "Mink",
-    mink = "Mink",
-
-    shark = "Fishman",
-    fish = "Fishman",
-    fishman = "Fishman",
-
-    angel = "Skypiea",
-    skypiea = "Skypiea",
-
-    human = "Human",
-    ghoul = "Ghoul",
-    cyborg = "Cyborg",
+    rabbit = "Mink", mink = "Mink",
+    shark = "Fishman", fish = "Fishman", fishman = "Fishman",
+    angel = "Skypiea", skypiea = "Skypiea",
+    human = "Human", ghoul = "Ghoul", cyborg = "Cyborg",
 }
 
 local REROLLABLE_RACES = {
@@ -79,62 +70,55 @@ local REROLLABLE_RACES = {
 }
 
 local Config = {
-    -- Team is intentionally fixed by spec.
     Team = "Marines",
 
-    -- Cake Prince progress.
-    TotalRequired = tonumber(UserConfig.TotalRequired) or 500,
-    QualifiedRemaining = tonumber(UserConfig.QualifiedRemaining) or 100,
-    ProgressPollInterval = tonumber(UserConfig.ProgressPollInterval) or 0.80,
-    ProgressUnknownGrace = tonumber(UserConfig.ProgressUnknownGrace) or 3.0,
+    -- Cake Prince.
+    TotalRequired = 500,
+    QualifiedRemaining = 150,
+    ProgressPollInterval = 0.65,
+    ProgressUnknownGrace = 3.0,
 
-    -- Roblox Server Browser.
-    BrowserMaxPages = math.clamp(tonumber(UserConfig.BrowserMaxPages) or 100, 1, 100),
-    PreferredPlayersMin = tonumber(UserConfig.PreferredPlayersMin) or 5,
-    PreferredPlayersMax = tonumber(UserConfig.PreferredPlayersMax) or 6,
-    -- Browser is scanned in parallel batches. 100 is still the hard maximum,
-    -- but a client leaves as soon as it has enough usable 5-6 player candidates.
-    BrowserPageDelay = tonumber(UserConfig.BrowserPageDelay) or 0,
-    BrowserBatchSize = math.clamp(tonumber(UserConfig.BrowserBatchSize) or 8, 1, 20),
-    BrowserBatchTimeout = tonumber(UserConfig.BrowserBatchTimeout) or 1.10,
-    BrowserTargetCandidates = math.clamp(tonumber(UserConfig.BrowserTargetCandidates) or 4, 1, 20),
-    BrowserCacheSeconds = tonumber(UserConfig.BrowserCacheSeconds) or 2,
-    CandidateLocalBlacklistSeconds = tonumber(UserConfig.CandidateLocalBlacklistSeconds) or 150,
-    TeleportWaitSeconds = tonumber(UserConfig.TeleportWaitSeconds) or 6,
+    -- Server Browser: fixed rules.
+    BrowserMaxPages = 100,
+    BrowserBatchSize = 20,
+    BrowserBatchTimeout = 0.75,
+    BrowserCacheSeconds = 1.0,
+    CandidateLocalBlacklistSeconds = 90,
 
-    -- Local coordinator.
-    EnableWebSocket = UserConfig.EnableWebSocket ~= false,
-    WSUrl = tostring(UserConfig.WSUrl or "ws://127.0.0.1:9877"),
-    RoomRequestInterval = tonumber(UserConfig.RoomRequestInterval) or 0.25,
-    RoomHeartbeatInterval = tonumber(UserConfig.RoomHeartbeatInterval) or 0.75,
-    ClientHeartbeatInterval = tonumber(UserConfig.ClientHeartbeatInterval) or 2,
-    WSAckTimeout = tonumber(UserConfig.WSAckTimeout) or 3.0,
-    WSStaleSeconds = tonumber(UserConfig.WSStaleSeconds) or 25,
-    SharedRoomWaitBeforeBrowser = tonumber(UserConfig.SharedRoomWaitBeforeBrowser) or 0.15,
-    ClaimReplyTimeout = tonumber(UserConfig.ClaimReplyTimeout) or 0.35,
+    -- Shared room joining.
+    WSUrl = "ws://127.0.0.1:9877",
+    RoomRequestInterval = 0.08,
+    RoomReplyTimeout = 0.35,
+    RoomHeartbeatInterval = 0.65,
+    ClientHeartbeatInterval = 1.5,
+    WSAckTimeout = 3.0,
+    WSStaleSeconds = 20,
+    ClaimReplyTimeout = 0.25,
+    TeleportWaitSeconds = 3.5,
 
     -- Farm/combat.
-    TweenSpeed = tonumber(UserConfig.TweenSpeed) or 340,
-    MobHoverHeight = tonumber(UserConfig.MobHoverHeight) or 20,
-    BossHoverHeight = tonumber(UserConfig.BossHoverHeight) or 25,
-    BringRadius = tonumber(UserConfig.BringRadius) or 350,
-    AttackRadius = tonumber(UserConfig.AttackRadius) or 75,
-    AttackInterval = math.max(0.02, tonumber(UserConfig.AttackInterval) or 0.035),
-    HoverFollowSharpness = tonumber(UserConfig.HoverFollowSharpness) or 24,
-    HoverSnapDistance = tonumber(UserConfig.HoverSnapDistance) or 6,
-    BusoCheckInterval = tonumber(UserConfig.BusoCheckInterval) or 0.75,
-    BusoRetryCooldown = tonumber(UserConfig.BusoRetryCooldown) or 1.25,
-    SpawnerCooldown = tonumber(UserConfig.SpawnerCooldown) or 1.0,
-    MirrorTouchCooldown = tonumber(UserConfig.MirrorTouchCooldown) or 1.0,
+    TweenSpeed = 340,
+    MobHoverHeight = 20,
+    BossHoverHeight = 25,
+    BringRadius = 350,
+    AttackRadius = 75,
+    AttackInterval = 0.035,
+    HoverFollowSharpness = 24,
+    HoverSnapDistance = 6,
+    BusoCheckInterval = 0.75,
+    BusoRetryCooldown = 1.25,
+    SpawnerCooldown = 1.0,
+    MirrorTouchCooldown = 1.0,
 
-    -- UI/debug.
-    UIUpdateInterval = tonumber(UserConfig.UIUpdateInterval) or 0.45,
-    Debug = UserConfig.Debug == true,
+    UIUpdateInterval = 0.45,
+    Debug = false,
 }
 
-if Config.PreferredPlayersMin > Config.PreferredPlayersMax then
-    Config.PreferredPlayersMin, Config.PreferredPlayersMax = Config.PreferredPlayersMax, Config.PreferredPlayersMin
-end
+local ALLOWED_BROWSER_PLAYERS = {
+    [4] = true,
+    [5] = true,
+    [6] = true,
+}
 
 -- ============================================================================
 -- [02] SERVICES / CONSTANTS
@@ -396,6 +380,9 @@ State = {
     LastClientHeartbeatAt = 0,
     PendingAssignment = nil,
     RoomHint = false,
+    RoomRequestNoRoom = false,
+    RoomRequestResolvedAt = 0,
+    SharedJoinFailures = 0,
     ForceLeaveRoom = false,
     ClaimReplies = {},
     RequestCounter = 0,
@@ -667,7 +654,7 @@ task.spawn(function()
                 State.CoordinatorClients,
                 State.CoordinatorRooms
             )
-            labels.Room.Text = "Room: " .. (State.InQualifiedRoom and "QUALIFIED / SHARING" or "SCOUT")
+            labels.Room.Text = "Room: " .. (State.InQualifiedRoom and "OPEN <=150 / SHARING" or "SCOUT")
             labels.Status.Text = "Status: " .. State.Status .. (State.Extra ~= "" and ("\n" .. State.Extra) or "")
         end)
         task.wait(Config.UIUpdateInterval)
@@ -1424,7 +1411,7 @@ end
 local function clientMeta(messageType)
     return {
         type = messageType,
-        version = 3,
+        version = 5,
         player = Player.Name,
         userId = Player.UserId,
         placeId = game.PlaceId,
@@ -1507,6 +1494,8 @@ local function requestSharedRoom(force)
     if not force and now - State.LastRoomRequestAt < Config.RoomRequestInterval then return false end
     State.LastRoomRequestAt = now
     State.RoomHint = false
+    State.RoomRequestNoRoom = false
+    State.RoomRequestResolvedAt = 0
     return wsSend({
         type = "request_room",
         requestId = nextRequestId("room"),
@@ -1516,6 +1505,8 @@ local function requestSharedRoom(force)
         jobId = game.JobId,
         playerCount = #Players:GetPlayers(),
         maxPlayers = Players.MaxPlayers,
+        state = State.Phase,
+        qualified = false,
     })
 end
 
@@ -1609,7 +1600,15 @@ local function handleWebSocketMessage(message)
         if tonumber(data.placeId) ~= game.PlaceId then return end
         if State.InQualifiedRoom then return end
         if type(data.jobId) ~= "string" or data.jobId == "" or data.jobId == game.JobId then return end
+        State.RoomRequestNoRoom = false
+        State.RoomRequestResolvedAt = os.clock()
         State.PendingAssignment = data
+        return
+    end
+
+    if data.type == "no_room" then
+        State.RoomRequestNoRoom = true
+        State.RoomRequestResolvedAt = os.clock()
         return
     end
 
@@ -1794,56 +1793,95 @@ local function processPendingAssignment()
 
     local playerCount = tonumber(assignment.playerCount) or 0
     local maxPlayers = tonumber(assignment.maxPlayers) or Players.MaxPlayers
+    local attempt = tonumber(assignment.attempt) or 1
+    local maxAttempts = tonumber(assignment.maxAttempts) or 2
+
     if playerCount >= maxPlayers then
         State.TeleportReservationId = tostring(assignment.reservationId or "")
         State.TeleportTarget = jobId
         assignmentFailed("room_reported_full")
         State.TeleportReservationId = nil
         State.TeleportTarget = nil
+        State.SharedJoinFailures += 1
+        setStatus(
+            "Shared room full - trying another room",
+            "SCOUT",
+            string.format("attempt=%d/%d | %s", attempt, maxAttempts, string.sub(jobId, 1, 12))
+        )
         return false
     end
 
     State.Hopping = true
     Movement.cancel()
+    setStatus(
+        "Joining shared room...",
+        "JOIN_SHARED_ROOM",
+        string.format("attempt=%d/%d | players=%d/%d | %s", attempt, maxAttempts, playerCount, maxPlayers, string.sub(jobId, 1, 12))
+    )
+
     local ok = teleportToJob(jobId, tostring(assignment.reservationId or ""), "JOIN_SHARED_ROOM")
     State.Hopping = false
+
+    if not ok then
+        State.SharedJoinFailures += 1
+        -- Important: move back to SCOUT before asking the coordinator again.
+        -- The server tracks failures per player+room:
+        -- attempt #1 -> same room is offered once more
+        -- attempt #2 -> that room is skipped and the next room is offered
+        setStatus(
+            "Shared join failed - retrying room pool",
+            "SCOUT",
+            string.format("failed attempt=%d/%d | %s", attempt, maxAttempts, string.sub(jobId, 1, 12))
+        )
+    end
+
     return ok
 end
 
 local Browser = {}
 
-local function shuffled(t)
-    local copy = {}
-    for i, v in ipairs(t) do copy[i] = v end
-    for i = #copy, 2, -1 do
-        local j = math.random(1, i)
-        copy[i], copy[j] = copy[j], copy[i]
+local function candidateTieScore(jobId)
+    -- Stable per-account permutation inside the same player-count group.
+    -- This keeps priority 4 -> 5 -> 6 while spreading 20 tabs across JobIds.
+    local h = Player.UserId % 2147483647
+    for i = 1, #jobId do
+        h = (h * 33 + string.byte(jobId, i)) % 2147483647
     end
-    return copy
+    return h
+end
+
+local function sortCandidates(candidates)
+    table.sort(candidates, function(a, b)
+        if a.players ~= b.players then
+            return a.players < b.players -- 4 first, then 5, then 6.
+        end
+        if a.tie ~= b.tie then
+            return a.tie < b.tie
+        end
+        return a.jobId < b.jobId
+    end)
+    return candidates
 end
 
 function Browser.scan()
     local now = os.clock()
     if State.BrowserCache and now - State.BrowserCacheAt < Config.BrowserCacheSeconds then
-        return shuffled(State.BrowserCache)
+        return sortCandidates(State.BrowserCache)
     end
 
     setStatus(
-        "Fast scanning Server Browser...",
+        "Scanning 100 pages...",
         "SCANNING",
-        string.format(
-            "max=%d pages | batch=%d | target players=%d-%d",
-            Config.BrowserMaxPages,
-            Config.BrowserBatchSize,
-            Config.PreferredPlayersMin,
-            Config.PreferredPlayersMax
-        )
+        "ONLY 4/5/6 players | priority 4 > 5 > 6"
     )
 
     local found = {}
     local seen = {}
     local startOffset = Player.UserId % Config.BrowserMaxPages
     local scanned = 0
+    local count4 = 0
+    local count5 = 0
+    local count6 = 0
 
     local function processPageData(data)
         if type(data) ~= "table" then return end
@@ -1852,31 +1890,35 @@ function Browser.scan()
             if type(jobId) == "string"
                 and not seen[jobId]
                 and count
-                and count >= Config.PreferredPlayersMin
-                and count <= Config.PreferredPlayersMax
+                and ALLOWED_BROWSER_PLAYERS[count] == true
                 and not jobBlocked(jobId)
             then
                 seen[jobId] = true
+                if count == 4 then count4 += 1
+                elseif count == 5 then count5 += 1
+                elseif count == 6 then count6 += 1
+                end
+
                 found[#found + 1] = {
                     jobId = jobId,
                     players = count,
                     region = info.Region,
                     lastUpdate = info.__LastUpdate,
+                    tie = candidateTieScore(jobId),
                 }
             end
         end
     end
 
-    -- Max 100 pages is preserved, but pages are fetched in small concurrent
-    -- batches and we leave early once enough 5-6 player candidates exist.
-    -- With 20 tabs, UserId offsets spread the batches across the browser.
+    -- Up to 20 ServerBrowser pages are requested concurrently.
+    -- We still have a HARD 100-page ceiling.
+    -- A shared room immediately interrupts this scan.
+    -- Early exit is allowed only when we already found several BEST (4-player)
+    -- candidates; otherwise keep scanning so 4-player servers are not missed.
     for batchStart = 1, Config.BrowserMaxPages, Config.BrowserBatchSize do
         if not State.Running or State.PendingAssignment or State.RoomHint then break end
 
-        local batchEnd = math.min(
-            Config.BrowserMaxPages,
-            batchStart + Config.BrowserBatchSize - 1
-        )
+        local batchEnd = math.min(Config.BrowserMaxPages, batchStart + Config.BrowserBatchSize - 1)
         local results = {}
         local pending = 0
 
@@ -1912,31 +1954,26 @@ function Browser.scan()
         end
 
         setStatus(
-            "Fast scanning Server Browser...",
+            "Scanning 100 pages...",
             "SCANNING",
             string.format(
-                "pages=%d/%d | candidates=%d | batch=%d",
-                scanned,
-                Config.BrowserMaxPages,
-                #found,
-                Config.BrowserBatchSize
+                "pages=%d/100 | 4p=%d | 5p=%d | 6p=%d",
+                scanned, count4, count5, count6
             )
         )
 
-        if #found >= Config.BrowserTargetCandidates then
+        -- Enough perfect 4-player targets: hop now instead of wasting more time.
+        if count4 >= 6 then
             break
         end
 
-        if Config.BrowserPageDelay > 0 then
-            task.wait(Config.BrowserPageDelay)
-        else
-            task.wait()
-        end
+        task.wait()
     end
 
+    sortCandidates(found)
     State.BrowserCacheAt = os.clock()
     State.BrowserCache = found
-    return shuffled(found)
+    return found
 end
 
 function Browser.hopCandidate()
@@ -1944,39 +1981,51 @@ function Browser.hopCandidate()
     State.Hopping = true
     Movement.cancel()
 
-    -- Short per-account stagger: all 20 tabs remain scouts, but they do not hit page 1 simultaneously.
-    local stagger = (Player.UserId % 20) * 0.035
+    -- Small de-correlation across 20 tabs.
+    local stagger = (Player.UserId % 20) * 0.02
     if stagger > 0 then task.wait(stagger) end
 
     local candidates = Browser.scan()
+
     for _, candidate in ipairs(candidates) do
         if not State.Running then break end
+
+        -- ROOM FIRST: stop browser immediately if any shared room appears.
         if State.PendingAssignment or State.RoomHint then
             State.Hopping = false
             return false
         end
+
         if not jobBlocked(candidate.jobId) then
             local granted, reason = claimCandidate(candidate.jobId, candidate.players)
+
             if reason == "room_assignment" then
                 State.Hopping = false
                 return false
             end
+
             if reason == "room" then
                 State.RoomHint = true
                 requestSharedRoom(true)
                 State.Hopping = false
                 return false
             elseif not granted and reason == "bad" then
-                blockJob(candidate.jobId, 60)
+                blockJob(candidate.jobId, 45)
             elseif not granted and reason == "claimed" then
-                blockJob(candidate.jobId, 12)
+                blockJob(candidate.jobId, 8)
             end
+
             if granted then
                 setStatus(
-                    "Testing medium server...",
+                    "Hopping candidate...",
                     "HOP_CANDIDATE",
-                    string.format("players=%d | %s", candidate.players, string.sub(candidate.jobId, 1, 12))
+                    string.format(
+                        "priority=%dp | %s",
+                        candidate.players,
+                        string.sub(candidate.jobId, 1, 12)
+                    )
                 )
+
                 local ok = teleportToJob(candidate.jobId, nil, "HOP_CANDIDATE")
                 if ok then
                     State.Hopping = false
@@ -1988,8 +2037,8 @@ function Browser.hopCandidate()
 
     State.BrowserCache = nil
     State.Hopping = false
-    setStatus("No usable 5-6 player candidate; rescanning...", "SCOUT")
-    task.wait(1)
+    setStatus("No usable 4/5/6 candidate - rescanning", "SCOUT")
+    task.wait(0.25)
     return false
 end
 
@@ -2061,6 +2110,60 @@ local function leaveQualifiedRoom(reason)
     task.wait(0.4)
 end
 
+local function trySharedRoomsBeforeBrowser()
+    if not State.WSConnected or not State.WSReady then
+        return false
+    end
+
+    -- Server controls the exact 2-attempt-per-room rule.
+    -- Client keeps asking until:
+    --   1) teleport succeeds (the old process disappears),
+    --   2) coordinator says no_room,
+    --   3) WS becomes unavailable.
+    --
+    -- Guard prevents a pathological local-server loop, but is deliberately
+    -- much higher than the expected number of rooms.
+    for _ = 1, 48 do
+        if not State.Running or State.InQualifiedRoom then return false end
+
+        if State.PendingAssignment then
+            if processPendingAssignment() then
+                return true
+            end
+            -- Failed attempt: ask again immediately. The coordinator will
+            -- offer the SAME room for attempt #2, then move to the next room.
+            task.wait(0.03)
+        end
+
+        State.RoomRequestNoRoom = false
+        requestSharedRoom(true)
+
+        local deadline = os.clock() + Config.RoomReplyTimeout
+        while State.Running
+            and os.clock() < deadline
+            and State.WSConnected
+            and not State.PendingAssignment
+            and not State.RoomRequestNoRoom
+        do
+            task.wait(0.02)
+        end
+
+        if State.PendingAssignment then
+            if processPendingAssignment() then
+                return true
+            end
+            task.wait(0.03)
+        elseif State.RoomRequestNoRoom then
+            return false
+        else
+            -- No reply quickly enough: fail open to Server Browser.
+            return false
+        end
+    end
+
+    return false
+end
+
 local function scoutStep(progress)
     State.InQualifiedRoom = false
     Movement.cancel()
@@ -2070,30 +2173,19 @@ local function scoutStep(progress)
         setStatus(
             "Server not qualified",
             "SCOUT",
-            string.format("remaining=%d > %d | looking for shared room", progress.remaining, Config.QualifiedRemaining)
+            string.format("remaining=%d > 150 | ROOM FIRST", progress.remaining)
         )
     elseif not progress or not progress.known then
-        setStatus("Progress unknown - retrying", "CHECK_PROGRESS")
+        setStatus("Progress unknown - ROOM FIRST", "CHECK_PROGRESS")
     end
 
-    requestSharedRoom(State.RoomHint)
-    local waitUntil = os.clock() + Config.SharedRoomWaitBeforeBrowser
-    while State.Running and os.clock() < waitUntil do
-        if State.PendingAssignment then
-            processPendingAssignment()
-            return
-        end
-        if State.RoomHint then
-            requestSharedRoom(true)
-        end
-        task.wait(0.05)
-    end
-
-    if State.PendingAssignment then
-        processPendingAssignment()
+    -- Highest priority: exhaust currently opened shared rooms.
+    if trySharedRoomsBeforeBrowser() then
         return
     end
 
+    -- No usable shared room after the coordinator's 2-attempt-per-room policy.
+    -- Only now do we scan/hop a fresh 4/5/6-player server.
     Browser.hopCandidate()
 end
 
